@@ -188,10 +188,15 @@ vi.mock("src/api/project/replay-sessions", () => ({
   useCreateReplaySessions: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
-vi.mock("src/api/project/saved-views", () => ({
+// Spread the real module: this factory replaces it wholesale, so a hook added on
+// dev (useGetSavedViews arrived with #2471) would otherwise be undefined at render
+// and take down every test in this file.
+vi.mock("src/api/project/saved-views", async (importOriginal) => ({
+  ...(await importOriginal()),
   useCreateSavedView: () => ({ mutate: vi.fn() }),
   useUpdateSavedView: () => ({ mutate: vi.fn() }),
   useUpdateWorkspaceSavedView: () => ({ mutate: vi.fn() }),
+  useGetSavedViews: () => ({ data: { custom_views: [] } }),
 }));
 
 vi.mock("src/utils/axios", () => ({
