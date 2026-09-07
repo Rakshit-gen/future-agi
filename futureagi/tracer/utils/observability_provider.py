@@ -1,10 +1,10 @@
 import copy
 import hashlib
 import json
+import random
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from datetime import timezone as dt_timezone
+from datetime import UTC, datetime, timedelta
 
 import requests
 import structlog
@@ -42,6 +42,7 @@ RETELL_WINDOW_HINT_MAX = timedelta(hours=6)
 RETELL_WINDOW_GROW_AFTER = 3
 RETELL_DIGEST_HISTORY = 8
 RETELL_MAX_PAGES_PER_WINDOW = 50
+RETELL_BOOTSTRAP_MAX_PAGES = 10
 RETELL_BEHIND_WARN = timedelta(minutes=20)
 RETELL_BEHIND_ERROR = timedelta(hours=6)
 RETELL_BACKOFF_BASE = timedelta(minutes=10)
@@ -50,6 +51,10 @@ RETELL_MAX_BACKOFF_EXPONENT = 6
 RETELL_MAX_FAILED_RUNS = 3
 RETELL_MAX_WINDOW_RESTARTS = 3
 RETELL_MANUAL_RUN_MAX_PAGES = 5
+RETELL_RUN_BUDGET = timedelta(minutes=20)
+RETELL_ACTIVITY_BUDGET = timedelta(
+    hours=2
+)  # comfortably inside the 3h activity time_limit
 
 
 @temporal_activity(
@@ -75,22 +80,33 @@ def fetch_observability_logs(
     if start_time is not None:
         start_dt = datetime.fromisoformat(start_time)
         if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=dt_timezone.utc)
+            start_dt = start_dt.replace(tzinfo=UTC)
     end_dt = None
     if end_time is not None:
         end_dt = datetime.fromisoformat(end_time)
         if end_dt.tzinfo is None:
-            end_dt = end_dt.replace(tzinfo=dt_timezone.utc)
+            end_dt = end_dt.replace(tzinfo=UTC)
+
+    # F1/N1: one activity-level deadline, computed once, threaded down to
+    # every Retell provider's run loop so the budget bounds the whole
+    # activity (and its 3h time_limit) rather than resetting per provider.
+    activity_started = timezone.now()
+    deadline = activity_started + RETELL_ACTIVITY_BUDGET
 
     if scheduled:
         if provider_id is not None:
-            provider_ids = [provider_id]
+            provider_ids = [
+                provider_id
+            ]  # single-provider dispatch: unchanged, no shuffle
         else:
             provider_ids = list(
-                ObservabilityProvider.objects.filter(enabled=True)
-                .values_list("id", flat=True)
-                .iterator(chunk_size=750)
+                ObservabilityProvider.objects.filter(enabled=True).values_list(
+                    "id", flat=True
+                )
             )
+            random.shuffle(
+                provider_ids
+            )  # F1: a starved tail rotates between firings instead of always being last
     else:
         if not provider_id:
             logger.error("provider_manual_run_rejected", reason="provider_id_required")
@@ -99,11 +115,19 @@ def fetch_observability_logs(
 
     success_count = 0
     failure_count = 0
+    skipped_providers = 0
 
     for pid in provider_ids:
+        if scheduled and timezone.now() >= deadline:
+            skipped_providers += 1
+            continue
         try:
             result = fetch_logs_for_provider(
-                pid, scheduled=scheduled, start_time=start_dt, end_time=end_dt
+                pid,
+                scheduled=scheduled,
+                start_time=start_dt,
+                end_time=end_dt,
+                deadline=deadline,
             )
         except Exception as exc:
             failure_count += 1
@@ -117,6 +141,11 @@ def fetch_observability_logs(
             success_count += 1
         else:
             failure_count += 1
+
+    if skipped_providers:
+        logger.warning(
+            "retell_activity_budget_exhausted", skipped_providers=skipped_providers
+        )
 
     logger.info(
         "Completed fetching observability logs",
@@ -138,6 +167,7 @@ def fetch_logs_for_provider(
     scheduled: bool,
     start_time: datetime | None,
     end_time: datetime | None,
+    deadline: datetime | None = None,
 ) -> StoreOutcome | None:
     try:
         provider = ObservabilityProvider.objects.get(id=provider_id)
@@ -158,15 +188,21 @@ def fetch_logs_for_provider(
     try:
         if provider.provider == ProviderChoices.RETELL:
             return (
-                _poll_retell_provider(provider)
+                _poll_retell_provider(provider, deadline=deadline)
                 if scheduled
-                else _manual_retell_run(provider, start_time=start_time, end_time=end_time)
+                else _manual_retell_run(
+                    provider, start_time=start_time, end_time=end_time
+                )
             )
+        # F1: the activity deadline only bounds Retell's own page loop; other
+        # providers' single-request polls ignore it.
         return _poll_other_provider(provider, start_time=start_time, end_time=end_time)
     except requests.HTTPError as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if provider.provider == ProviderChoices.RETELL and status in (401, 403):
-            logger.error("retell_auth_failed", provider_id=str(provider_id), status_code=status)
+            logger.error(
+                "retell_auth_failed", provider_id=str(provider_id), status_code=status
+            )
         elif provider.provider != ProviderChoices.RETELL and status in (401, 403):
             logger.error(
                 "authentication_failed_for_provider",
@@ -213,7 +249,9 @@ def _write_retell_state(provider_id, retell_state: dict) -> bool:
     )
     merged = dict(row) if isinstance(row, dict) else {}
     merged["retell"] = retell_state
-    n = ObservabilityProvider.all_objects.filter(id=provider_id).update(poll_state=merged)
+    n = ObservabilityProvider.all_objects.filter(id=provider_id).update(
+        poll_state=merged
+    )
     if n == 0:
         logger.error("provider_poll_state_write_skipped", provider_id=str(provider_id))
     return n == 1
@@ -232,61 +270,114 @@ def _advance_watermark(provider_id, new: datetime) -> int:  # monotonic
     return n
 
 
-def _repair_future_watermark(provider_id, now: datetime, new: datetime) -> int:  # the single exception to monotonicity
-    n = ObservabilityProvider.all_objects.filter(id=provider_id, last_fetched_at__gt=now).update(
-        last_fetched_at=new
-    )
+def _repair_future_watermark(
+    provider_id, now: datetime, new: datetime
+) -> int:  # the single exception to monotonicity
+    n = ObservabilityProvider.all_objects.filter(
+        id=provider_id, last_fetched_at__gt=now
+    ).update(last_fetched_at=new)
     if n:
-        logger.warning("provider_watermark_repaired", provider_id=str(provider_id), new=new.isoformat())
+        logger.warning(
+            "provider_watermark_repaired",
+            provider_id=str(provider_id),
+            new=new.isoformat(),
+        )
     return n
 
 
 def _page_digest(calls: list[dict]) -> str | None:
     if not calls:
         return None
-    return hashlib.sha256(",".join(sorted(c["call_id"] for c in calls)).encode()).hexdigest()
+    return hashlib.sha256(
+        ",".join(sorted(c["call_id"] for c in calls)).encode()
+    ).hexdigest()
 
 
 def _parse(iso: str) -> datetime:
-    return datetime.fromisoformat(iso)  # values were written by .isoformat() on aware UTC datetimes
+    return datetime.fromisoformat(
+        iso
+    )  # values were written by .isoformat() on aware UTC datetimes
 
 
 def _backoff_delay(total_failures: int) -> timedelta:
     return min(
-        RETELL_BACKOFF_BASE * (2 ** min(total_failures - 1, RETELL_MAX_BACKOFF_EXPONENT)),
+        RETELL_BACKOFF_BASE
+        * (2 ** min(total_failures - 1, RETELL_MAX_BACKOFF_EXPONENT)),
         RETELL_BACKOFF_MAX,
     )
 
 
 def _hint_for(state) -> timedelta:
-    return timedelta(seconds=state.get("window_hint_seconds", int(RETELL_WINDOW_HINT_MAX.total_seconds())))
+    return timedelta(
+        seconds=state.get(
+            "window_hint_seconds", int(RETELL_WINDOW_HINT_MAX.total_seconds())
+        )
+    )
 
 
 _WINDOW_TYPES = {
-    "start": str,
+    "start": (str, type(None)),  # None = bootstrap window
     "end": str,
     "opened_at_hint": bool,
     "narrowed": bool,
     "key": (str, type(None)),
     "skip": (int, type(None)),
     "pages_stored": int,
+    "total_pages": int,  # monotone across restarts (unlike pages_stored); bootstrap-cap-only, carried harmlessly by ordinary windows too
     "digests": list,
     "restarts": int,
 }
+
+
+def _backfill_total_pages(window) -> None:
+    """F4/N5: a window persisted by v1.13 (before B7) has no "total_pages" key
+    and would otherwise fail `_valid_window` on deploy, discarding an
+    in-progress window instead of resuming it. Backfill it from the pages
+    already stored for this window before validation runs, so a v1.13 window
+    resumes rather than being re-listed from scratch."""
+    if isinstance(window, dict):
+        window.setdefault("total_pages", window.get("pages_stored", 0))
 
 
 def _valid_window(window) -> bool:
     if not isinstance(window, dict):
         return False
     try:
-        return all(isinstance(window[k], t) for k, t in _WINDOW_TYPES.items()) and \
-            _parse(window["start"]).tzinfo is not None and _parse(window["end"]).tzinfo is not None
+        if not all(isinstance(window[k], t) for k, t in _WINDOW_TYPES.items()):
+            return False
+        if window["start"] is not None and _parse(window["start"]).tzinfo is None:
+            return False  # bootstrap window: "start" is None, nothing to parse
+        return _parse(window["end"]).tzinfo is not None
     except (KeyError, ValueError, TypeError):
         return False
 
 
-def _classify(page: RetellPage, outcome: StoreOutcome) -> str:  # "ok" | "total" | "partial"
-    problems = outcome.export_failed + page.dropped_failed  # infra-shaped failures (retryable)
+def _new_window(
+    start: datetime | None, end: datetime, *, opened_at_hint: bool, narrowed: bool
+) -> dict:
+    """F6/N6: the one place that builds a fresh window dict — bootstrap
+    (``start=None``) and ordinary windows differ only in ``start``/``end``/
+    ``opened_at_hint``; every other key is a shared, unconditional default."""
+    return {
+        "start": None if start is None else start.isoformat(),
+        "end": end.isoformat(),
+        "opened_at_hint": opened_at_hint,
+        "narrowed": narrowed,
+        "key": None,
+        "skip": None,
+        "pages_stored": 0,
+        "total_pages": 0,
+        "digests": [],
+        "restarts": 0,
+    }
+
+
+def _classify(
+    page: RetellPage, outcome: StoreOutcome
+) -> str:  # "ok" | "total" | "partial"
+    problems = (
+        outcome.export_failed + page.dropped_failed
+    )  # infra-shaped failures (retryable)
     if problems == 0:
         return "ok"  # malformed-only pages are "ok": permanent, counted, never retried
     if outcome.stored == 0 and problems >= outcome.malformed:
@@ -294,151 +385,234 @@ def _classify(page: RetellPage, outcome: StoreOutcome) -> str:  # "ok" | "total"
     return "partial"  # retry the same page up to RETELL_MAX_FAILED_RUNS, then abandon the problems
 
 
-def _poll_retell_provider(provider) -> StoreOutcome | None:
+def _poll_retell_provider(
+    provider, *, deadline: datetime | None = None
+) -> StoreOutcome | None:
     provider_id = provider.id
     now = timezone.now()
+    run_started = now  # same call as `now`: F2's per-run budget is measured from here
+    # F1: an activity-level deadline (threaded from the scheduled fan-out) caps
+    # the run budget from outside; None (manual runs, direct callers) leaves
+    # only the run budget in effect.
+    run_deadline = run_started + RETELL_RUN_BUDGET
+    if deadline is not None:
+        run_deadline = min(run_deadline, deadline)
     end = now - RETELL_VISIBILITY_LAG
     state = _read_retell_state(provider)
 
     try:
-        backoff_until = _parse(state["backoff_until"]) if isinstance(state.get("backoff_until"), str) else None
+        backoff_until = (
+            _parse(state["backoff_until"])
+            if isinstance(state.get("backoff_until"), str)
+            else None
+        )
     except ValueError:
         backoff_until = None
     if backoff_until is not None and backoff_until > now:
-        logger.warning("retell_poll_backoff", provider_id=str(provider_id), until=state["backoff_until"])
+        logger.warning(
+            "retell_poll_backoff",
+            provider_id=str(provider_id),
+            until=state["backoff_until"],
+        )
         return StoreOutcome(0, 0, 0)
 
-    if not state.get("bootstrapped"):  # first run under this code, whatever last_fetched_at says (D10)
-        page = ObservabilityService.fetch_retell_page(provider, None, end)
+    if not state.get(
+        "bootstrapped"
+    ):  # first run under this code, whatever last_fetched_at says (D10)
+        window = state.get("window")
+        # v1.13 §7: a stale window is discarded when bootstrapped is falsy —
+        # UNLESS it is itself a bootstrap window (start is None), which is
+        # resumed rather than restarted from scratch. No total_pages backfill
+        # here: v1.13 never persisted a bootstrap window, and an ordinary
+        # v1.13 window is discarded by this very check.
+        if not _valid_window(window) or window["start"] is not None:
+            window = (
+                None  # anything malformed, or a stale ordinary window, is discarded
+            )
+        if window is None:
+            # A bootstrap window pages the same as an ordinary one, just with
+            # "start": None; "end" is frozen here and reused by every later
+            # page of this bootstrap, however many runs it takes.
+            window = _new_window(None, end, opened_at_hint=False, narrowed=False)
+            state["window"] = window
+    else:
+        wm = provider.last_fetched_at
+        if wm is None:  # cannot happen after a successful bootstrap; treat like poison
+            logger.warning("provider_watermark_missing", provider_id=str(provider_id))
+            start = end - RETELL_FUTURE_WATERMARK_LOOKBACK
+        elif wm > now:
+            logger.warning("provider_watermark_in_future", provider_id=str(provider_id))
+            start = end - RETELL_FUTURE_WATERMARK_LOOKBACK
+            _repair_future_watermark(provider_id, now, start)
+        else:
+            start = wm
+
+        window = state.get("window")
+        _backfill_total_pages(window)
+        if not _valid_window(window):
+            window = None  # anything malformed is treated as "no window in progress"
+        if window is None:
+            if start >= end:
+                return StoreOutcome(0, 0, 0)
+            hint = _hint_for(state)
+            opened_at_hint = (end - start) >= hint
+            end = min(end, start + hint)  # a new window is never wider than the hint
+            window = _new_window(
+                start, end, opened_at_hint=opened_at_hint, narrowed=False
+            )
+            state["window"] = window
+
+    bootstrap = window["start"] is None
+    window_start = None if bootstrap else _parse(window["start"])
+    window_end = _parse(window["end"])
+
+    while True:
+        try:
+            page = ObservabilityService.fetch_retell_page(
+                provider,
+                window_start,
+                window_end,
+                pagination_key=window["key"],
+                skip=window["skip"],
+            )
+        except RetellCursorRejected as exc:
+            return _restart_window(provider_id, state, cause=exc.cause)
+        digest = _page_digest(page.calls)
+        if window["pages_stored"] > 0 and page.has_more and digest is None:
+            return _restart_window(provider_id, state, cause="empty_page")
+        if digest is not None and digest in window["digests"]:
+            return _restart_window(provider_id, state, cause="page_repeated")
+        if (
+            not bootstrap
+            and page.has_more
+            and window["pages_stored"] + 1 >= RETELL_MAX_PAGES_PER_WINDOW
+        ):  # a window that needs more than 50 pages is not being paged honestly: restart → narrow
+            return _restart_window(provider_id, state, cause="page_cap")
+
         outcome = process_and_store_logs(page.calls, provider)
-        _log_counts(provider_id, "bootstrap", 0, page, outcome)
+        _log_counts(
+            provider_id,
+            "bootstrap" if bootstrap else "window",
+            window["pages_stored"],
+            page,
+            outcome,
+        )
         verdict = _classify(page, outcome)
         if verdict == "total":
             return _on_total_failure(provider_id, state, page, outcome)
+        state.pop("total_failures", None)
+        state.pop("backoff_until", None)
         if verdict == "partial":
             state["failed_runs"] = state.get("failed_runs", 0) + 1
             if state["failed_runs"] < RETELL_MAX_FAILED_RUNS:
                 _log_incomplete(provider_id, page, outcome, state["failed_runs"])
                 _write_retell_state(provider_id, state)
-                return None  # bootstrap is retried next run; marker not set
+                return None  # same page is retried next run (bootstrap: marker not set until it completes)
             logger.error(
                 "retell_page_abandoned",
                 provider_id=str(provider_id),
                 abandoned=outcome.export_failed + page.dropped_failed,
                 failed_runs=state["failed_runs"],
             )
+        state.pop("failed_runs", None)
         if outcome.stored == 0 and outcome.malformed > 0:
-            logger.warning("retell_page_all_malformed", provider_id=str(provider_id), malformed=outcome.malformed)
-        if _repair_future_watermark(provider_id, end, end) == 0:  # any watermark later than the bootstrap end is invalid after a bootstrap
-            _advance_watermark(provider_id, end)
-        state = {"bootstrapped": True}  # nothing from an older layout survives the bootstrap
-        if not _write_retell_state(provider_id, state):
-            return None
-        return outcome
-
-    wm = provider.last_fetched_at
-    if wm is None:  # cannot happen after a successful bootstrap; treat like poison
-        logger.warning("provider_watermark_missing", provider_id=str(provider_id))
-        start = end - RETELL_FUTURE_WATERMARK_LOOKBACK
-    elif wm > now:
-        logger.warning("provider_watermark_in_future", provider_id=str(provider_id))
-        start = end - RETELL_FUTURE_WATERMARK_LOOKBACK
-        _repair_future_watermark(provider_id, now, start)
-    else:
-        start = wm
-
-    window = state.get("window")
-    if not _valid_window(window):
-        window = None  # anything malformed is treated as "no window in progress"
-    if window is None:
-        if start >= end:
-            return StoreOutcome(0, 0, 0)
-        hint = _hint_for(state)
-        opened_at_hint = (end - start) >= hint
-        end = min(end, start + hint)  # a new window is never wider than the hint
-        window = {
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "opened_at_hint": opened_at_hint,
-            "narrowed": False,
-            "key": None,
-            "skip": None,
-            "pages_stored": 0,
-            "digests": [],
-            "restarts": 0,
-        }
-        state["window"] = window
-    window_start, window_end = _parse(window["start"]), _parse(window["end"])
-
-    try:
-        page = ObservabilityService.fetch_retell_page(
-            provider, window_start, window_end, pagination_key=window["key"], skip=window["skip"]
+            logger.warning(
+                "retell_page_all_malformed",
+                provider_id=str(provider_id),
+                malformed=outcome.malformed,
+            )
+        window["pages_stored"] += 1
+        window["total_pages"] += (
+            1  # never reset by _restart_window: the bootstrap cap survives restarts (v1.14 R1 H1)
         )
-    except RetellCursorRejected as exc:
-        return _restart_window(provider_id, state, cause=exc.cause)
-    digest = _page_digest(page.calls)
-    if window["pages_stored"] > 0 and page.has_more and digest is None:
-        return _restart_window(provider_id, state, cause="empty_page")
-    if digest is not None and digest in window["digests"]:
-        return _restart_window(provider_id, state, cause="page_repeated")
-    if page.has_more and window["pages_stored"] + 1 >= RETELL_MAX_PAGES_PER_WINDOW:  # a window that needs more than 50 pages is not being paged honestly: restart → narrow
-        return _restart_window(provider_id, state, cause="page_cap")
+        if digest is not None:
+            window["digests"] = (window["digests"] + [digest])[-RETELL_DIGEST_HISTORY:]
 
-    outcome = process_and_store_logs(page.calls, provider)
-    _log_counts(provider_id, "window", window["pages_stored"], page, outcome)
-    verdict = _classify(page, outcome)
-    if verdict == "total":
-        return _on_total_failure(provider_id, state, page, outcome)
-    state.pop("total_failures", None)
-    state.pop("backoff_until", None)
-    if verdict == "partial":
-        state["failed_runs"] = state.get("failed_runs", 0) + 1
-        if state["failed_runs"] < RETELL_MAX_FAILED_RUNS:
-            _log_incomplete(provider_id, page, outcome, state["failed_runs"])
-            _write_retell_state(provider_id, state)
-            return None  # same page (same key/skip) is retried next run
-        logger.error(
-            "retell_page_abandoned",
-            provider_id=str(provider_id),
-            abandoned=outcome.export_failed + page.dropped_failed,
-            failed_runs=state["failed_runs"],
+        # A page cap caught here (post-store) completes the bootstrap instead of
+        # restarting it: unlike a windowed page_cap, this is not "paging isn't
+        # working", just "that's enough calls for a first sync" (newest 1000).
+        # Measured against total_pages (restart-proof), not pages_stored (reset
+        # by every restart) — see H1.
+        capped = (
+            bootstrap
+            and page.has_more
+            and window["total_pages"] >= RETELL_BOOTSTRAP_MAX_PAGES
         )
-    state.pop("failed_runs", None)
-    if outcome.stored == 0 and outcome.malformed > 0:
-        logger.warning("retell_page_all_malformed", provider_id=str(provider_id), malformed=outcome.malformed)
-    window["pages_stored"] += 1
-    if digest is not None:
-        window["digests"] = (window["digests"] + [digest])[-RETELL_DIGEST_HISTORY:]
-    if page.has_more:
-        if window["skip"] is not None:
-            window["skip"] += RETELL_LIST_PAGE_LIMIT
+        if capped:
+            logger.info(
+                "retell_bootstrap_capped",
+                provider_id=str(provider_id),
+                pages_stored=window["pages_stored"],
+                total_pages=window[
+                    "total_pages"
+                ],  # F7/N8: pages_stored kept for continuity
+            )
+
+        if page.has_more and not capped:
+            if window["skip"] is not None:
+                window["skip"] += RETELL_LIST_PAGE_LIMIT
+            else:
+                window["key"] = page.next_key
+            if not _write_retell_state(provider_id, state):
+                return None
+            if not bootstrap:  # the bootstrap frontier is frozen, not "behind"
+                # F2/N2: a fresh clock reading, not the run-start `now` — a
+                # multi-page run can span the RETELL_BEHIND_WARN threshold, and
+                # window bounds (not lag reporting) are what must stay frozen.
+                _log_behind(
+                    provider_id, timezone.now(), window_end, window["pages_stored"]
+                )
+            # checkpointed: a run that dies here resumes from here, not from
+            # the start. Still within the per-run wall-clock budget (and, when
+            # given, the activity-level deadline): keep paging in this same
+            # run instead of returning (v1.14 R1 M2; N1 F1).
+            if timezone.now() < run_deadline:
+                continue
+            return outcome
+
+        if bootstrap:
+            if not _complete_bootstrap(provider_id, state, window_end):
+                return None
+            return outcome
+
+        # Hint recovery. (1) Cursor paging just completed a multi-page window without a restart: cursors work, drop the cap entirely.
+        # (2) Otherwise a streak of one-page windows opened at the hint (never narrowed) says the hint may be too small; one such window
+        #     is not enough (the window right after a narrowing completes on page 1 by construction), a streak is. Any one-page window
+        #     counts, whatever its size, so there is no dead band between "grow" and "narrow".
+        if (
+            window["pages_stored"] >= 2
+            and not window["narrowed"]
+            and window["restarts"] == 0
+            and window["skip"] is None
+        ):
+            state.pop("window_hint_seconds", None)
+            state.pop("one_page_streak", None)
+        elif (
+            window["opened_at_hint"]
+            and not window["narrowed"]
+            and window["pages_stored"] == 1
+        ):
+            state["one_page_streak"] = state.get("one_page_streak", 0) + 1
+            if state["one_page_streak"] >= RETELL_WINDOW_GROW_AFTER:
+                state["window_hint_seconds"] = int(
+                    min(_hint_for(state) * 2, RETELL_WINDOW_HINT_MAX).total_seconds()
+                )
+                state["one_page_streak"] = 0
         else:
-            window["key"] = page.next_key
+            state.pop("one_page_streak", None)
+        state.pop(
+            "window", None
+        )  # the window is complete; the next run opens a new one from window_end
         if not _write_retell_state(provider_id, state):
             return None
-        _log_behind(provider_id, now, window_end, window["pages_stored"])
-        return outcome  # watermark unchanged until the window completes
-    # Hint recovery. (1) Cursor paging just completed a multi-page window without a restart: cursors work, drop the cap entirely.
-    # (2) Otherwise a streak of one-page windows opened at the hint (never narrowed) says the hint may be too small; one such window
-    #     is not enough (the window right after a narrowing completes on page 1 by construction), a streak is. Any one-page window
-    #     counts, whatever its size, so there is no dead band between "grow" and "narrow".
-    if window["pages_stored"] >= 2 and not window["narrowed"] and window["restarts"] == 0 and window["skip"] is None:
-        state.pop("window_hint_seconds", None)
-        state.pop("one_page_streak", None)
-    elif window["opened_at_hint"] and not window["narrowed"] and window["pages_stored"] == 1:
-        state["one_page_streak"] = state.get("one_page_streak", 0) + 1
-        if state["one_page_streak"] >= RETELL_WINDOW_GROW_AFTER:
-            state["window_hint_seconds"] = int(min(_hint_for(state) * 2, RETELL_WINDOW_HINT_MAX).total_seconds())
-            state["one_page_streak"] = 0
-    else:
-        state.pop("one_page_streak", None)
-    state.pop("window", None)  # the window is complete; the next run opens a new one from window_end
-    if not _write_retell_state(provider_id, state):
-        return None
-    _advance_watermark(provider_id, window_end)
-    if (now - window_end) > RETELL_BEHIND_WARN:  # independent of has_more: a capped window that leaves the frontier old is also "behind"
-        _log_behind(provider_id, now, window_end, window["pages_stored"])
-    return outcome
+        _advance_watermark(provider_id, window_end)
+        # F2/N2: fresh clock here too, for the same reason as the in-loop check above.
+        behind_now = timezone.now()
+        if (
+            (behind_now - window_end) > RETELL_BEHIND_WARN
+        ):  # independent of has_more: a capped window that leaves the frontier old is also "behind"
+            _log_behind(provider_id, behind_now, window_end, window["pages_stored"])
+        return outcome
 
 
 def _log_counts(provider_id, mode, pages_stored, page, outcome):
@@ -460,9 +634,19 @@ def _log_counts(provider_id, mode, pages_stored, page, outcome):
 def _log_behind(provider_id, now, window_end, pages_stored):
     age = int((now - window_end).total_seconds())
     if age > RETELL_BEHIND_ERROR.total_seconds():
-        logger.error("retell_poll_stalled", provider_id=str(provider_id), frontier_age_seconds=age, pages_stored=pages_stored)
+        logger.error(
+            "retell_poll_stalled",
+            provider_id=str(provider_id),
+            frontier_age_seconds=age,
+            pages_stored=pages_stored,
+        )
     else:
-        logger.warning("retell_poll_behind", provider_id=str(provider_id), frontier_age_seconds=age, pages_stored=pages_stored)
+        logger.warning(
+            "retell_poll_behind",
+            provider_id=str(provider_id),
+            frontier_age_seconds=age,
+            pages_stored=pages_stored,
+        )
 
 
 def _log_incomplete(provider_id, page, outcome, failed_runs):
@@ -477,12 +661,34 @@ def _log_incomplete(provider_id, page, outcome, failed_runs):
     )
 
 
-def _on_total_failure(provider_id, state, page, outcome) -> None:  # outage / misconfiguration: wait with backoff, never abandon
+def _on_total_failure(
+    provider_id, state, page, outcome
+) -> None:  # outage / misconfiguration: wait with backoff, never abandon
     state["total_failures"] = state.get("total_failures", 0) + 1
-    state["backoff_until"] = (timezone.now() + _backoff_delay(state["total_failures"])).isoformat()  # fresh clock: the page may have taken minutes
+    state["backoff_until"] = (
+        timezone.now() + _backoff_delay(state["total_failures"])
+    ).isoformat()  # fresh clock: the page may have taken minutes
     _log_incomplete(provider_id, page, outcome, state.get("failed_runs", 0))
-    _write_retell_state(provider_id, state)  # a skipped write is logged by the helper; this run ends without progress either way
+    _write_retell_state(
+        provider_id, state
+    )  # a skipped write is logged by the helper; this run ends without progress either way
     return None
+
+
+def _complete_bootstrap(provider_id, state, end: datetime) -> bool:
+    """Finish a bootstrap: watermark repair/advance to ``end`` (the frozen
+    first-run end), then replace state with just the marker. Shared by the
+    normal completion path (page loop, not has_more / capped) and the
+    terminal branch of ``_restart_window`` (offset mode also stuck) so the
+    two can never drift (v1.14 R1 H1). Returns whether the write succeeded.
+    """
+    if (
+        _repair_future_watermark(provider_id, end, end) == 0
+    ):  # any watermark later than the bootstrap end is invalid after a bootstrap
+        _advance_watermark(provider_id, end)
+    state.clear()
+    state["bootstrapped"] = True  # nothing from an older layout survives the bootstrap
+    return _write_retell_state(provider_id, state)
 
 
 def _restart_window(provider_id, state, *, cause) -> None:
@@ -499,9 +705,12 @@ def _restart_window(provider_id, state, *, cause) -> None:
     window["pages_stored"] = 0
     window["digests"] = []
     if window["restarts"] >= RETELL_MAX_WINDOW_RESTARTS:
-        window_start, window_end = _parse(window["start"]), _parse(window["end"])
-        width = window_end - window_start
-        if width > RETELL_MIN_WINDOW:  # paging is not working: halve this window and remember the size for new windows
+        bootstrap = window["start"] is None
+        width = None if bootstrap else _parse(window["end"]) - _parse(window["start"])
+        if (
+            not bootstrap and width > RETELL_MIN_WINDOW
+        ):  # paging is not working: halve this window and remember the size for new windows
+            window_start = _parse(window["start"])
             new_end = window_start + width / 2
             window["end"] = new_end.isoformat()
             window["skip"] = None
@@ -509,33 +718,56 @@ def _restart_window(provider_id, state, *, cause) -> None:
             window["narrowed"] = True
             state["window_hint_seconds"] = max(1, int((width / 2).total_seconds()))
             state.pop("one_page_streak", None)
-            logger.warning("retell_window_narrowed", provider_id=str(provider_id), window_seconds=state["window_hint_seconds"])
-        elif window["skip"] is None:  # ≤ 1 s and still > 1000 calls: last resort, offset paging (D15)
+            logger.warning(
+                "retell_window_narrowed",
+                provider_id=str(provider_id),
+                window_seconds=state["window_hint_seconds"],
+            )
+        elif (
+            window["skip"] is None
+        ):  # bootstrap, or ≤ 1 s and still > RETELL_LIST_PAGE_LIMIT calls: last resort, offset paging (D15)
             window["skip"] = 0
             window["restarts"] = 0
             logger.error("retell_window_offset_mode", provider_id=str(provider_id))
-        else:  # offset paging failed too: stall loudly, never advance
+        else:  # offset paging failed too: terminal for bootstrap (v1.14 R1 H1), stall loudly for windows
+            logger.error("retell_window_stuck", provider_id=str(provider_id))
+            if bootstrap:
+                _complete_bootstrap(provider_id, state, _parse(window["end"]))
+                return None
             window["skip"] = 0
             window["restarts"] = 0
-            logger.error("retell_window_stuck", provider_id=str(provider_id))
     else:
-        window["skip"] = 0 if window["skip"] is not None else None  # stay in the current mode, from its first page
+        window["skip"] = (
+            0 if window["skip"] is not None else None
+        )  # stay in the current mode, from its first page
     _write_retell_state(provider_id, state)
     return None
 
 
-def _manual_retell_run(provider, *, start_time: datetime | None, end_time: datetime | None) -> StoreOutcome | None:
+def _manual_retell_run(
+    provider, *, start_time: datetime | None, end_time: datetime | None
+) -> StoreOutcome | None:
     provider_id = provider.id
     if start_time is None:
-        logger.error("provider_manual_run_rejected", provider_id=str(provider_id), reason="start_time_required")
+        logger.error(
+            "provider_manual_run_rejected",
+            provider_id=str(provider_id),
+            reason="start_time_required",
+        )
         return None
     end = end_time or (timezone.now() - RETELL_VISIBILITY_LAG)
     if start_time >= end:
-        logger.error("provider_manual_run_rejected", provider_id=str(provider_id), reason="empty_range")
+        logger.error(
+            "provider_manual_run_rejected",
+            provider_id=str(provider_id),
+            reason="empty_range",
+        )
         return None
     key, pages, calls, has_more, outcome = None, 0, 0, False, StoreOutcome(0, 0, 0)
     while pages < RETELL_MANUAL_RUN_MAX_PAGES:
-        page = ObservabilityService.fetch_retell_page(provider, start_time, end, pagination_key=key)  # RetellCursorRejected propagates: the run fails
+        page = ObservabilityService.fetch_retell_page(
+            provider, start_time, end, pagination_key=key
+        )  # RetellCursorRejected propagates: the run fails
         outcome = process_and_store_logs(page.calls, provider)
         _log_counts(provider_id, "manual", pages, page, outcome)
         pages += 1
@@ -544,27 +776,41 @@ def _manual_retell_run(provider, *, start_time: datetime | None, end_time: datet
         if not page.has_more:
             break
         key = page.next_key
-    logger.info("retell_manual_run_covered", provider_id=str(provider_id), pages=pages, calls=calls, has_more=has_more)
+    logger.info(
+        "retell_manual_run_covered",
+        provider_id=str(provider_id),
+        pages=pages,
+        calls=calls,
+        has_more=has_more,
+    )
     return outcome
 
 
-def _poll_other_provider(provider, *, start_time: datetime | None, end_time: datetime | None) -> StoreOutcome:
+def _poll_other_provider(
+    provider, *, start_time: datetime | None, end_time: datetime | None
+) -> StoreOutcome:
     provider_id = provider.id
     now = timezone.now()
     end = min(end_time or now, now)
     if provider.last_fetched_at is not None and provider.last_fetched_at > now:
         logger.warning("provider_watermark_in_future", provider_id=str(provider_id))
-        _repair_future_watermark(provider_id, now, now - RETELL_FUTURE_WATERMARK_LOOKBACK)
+        _repair_future_watermark(
+            provider_id, now, now - RETELL_FUTURE_WATERMARK_LOOKBACK
+        )
         start = now - RETELL_FUTURE_WATERMARK_LOOKBACK
     else:
-        start = start_time if start_time is not None else provider.last_fetched_at  # today's precedence: explicit start wins
+        start = (
+            start_time if start_time is not None else provider.last_fetched_at
+        )  # today's precedence: explicit start wins
     logger.info(
         "provider_log_fetch_started",
         provider_type=provider.provider,
         start_time=str(start) if start else None,
         end_time=str(end),
     )
-    logs = ObservabilityService.get_call_logs(provider=provider, start_time=start, end_time=end)  # HTTPError propagates to fetch_logs_for_provider
+    logs = ObservabilityService.get_call_logs(
+        provider=provider, start_time=start, end_time=end
+    )  # HTTPError propagates to fetch_logs_for_provider
     try:
         outcome = process_and_store_logs(logs, provider)
     except Exception as exc:
@@ -575,7 +821,9 @@ def _poll_other_provider(provider, *, start_time: datetime | None, end_time: dat
             error_type=type(exc).__name__,
         )
         raise  # CHANGED from today: no advance and the run counts as failed (today it advanced before storing and reported success)
-    _advance_watermark(provider_id, end)  # after the store (today it is before); not gated on the outcome counts
+    _advance_watermark(
+        provider_id, end
+    )  # after the store (today it is before); not gated on the outcome counts
     logger.info(
         "Successfully fetched and stored logs for provider",
         provider_id=str(provider_id),
@@ -596,25 +844,25 @@ def _create_observation_span(
     upserts in place under the CH RMT sort keys (both include trace_id) instead
     of duplicating.
     """
-    span_kwargs = dict(
-        id=uuid.uuid4(),
-        project=project,
-        name=f"{provider.provider.capitalize()} Call Log",
-        observation_type="conversation",
-        start_time=normalized_data.get("start_time"),
-        end_time=normalized_data.get("end_time"),
-        input=normalized_data.get("input", {}),
-        output=normalized_data.get("output", {}),
-        metadata=metadata,
-        provider=provider.provider,
-        cost=normalized_data.get("cost"),
-        status=normalized_data.get("status"),
-        span_attributes=normalized_data.get("span_attributes", {}),
-        prompt_tokens=normalized_data.get("prompt_tokens"),
-        completion_tokens=normalized_data.get("completion_tokens"),
-        total_tokens=normalized_data.get("total_tokens"),
-        latency_ms=normalized_data.get("latency_ms"),
-    )
+    span_kwargs = {
+        "id": uuid.uuid4(),
+        "project": project,
+        "name": f"{provider.provider.capitalize()} Call Log",
+        "observation_type": "conversation",
+        "start_time": normalized_data.get("start_time"),
+        "end_time": normalized_data.get("end_time"),
+        "input": normalized_data.get("input", {}),
+        "output": normalized_data.get("output", {}),
+        "metadata": metadata,
+        "provider": provider.provider,
+        "cost": normalized_data.get("cost"),
+        "status": normalized_data.get("status"),
+        "span_attributes": normalized_data.get("span_attributes", {}),
+        "prompt_tokens": normalized_data.get("prompt_tokens"),
+        "completion_tokens": normalized_data.get("completion_tokens"),
+        "total_tokens": normalized_data.get("total_tokens"),
+        "latency_ms": normalized_data.get("latency_ms"),
+    }
     trace = Trace(
         id=_provider_collector_trace_id(project.id, provider.provider, provider_log_id),
         project=project,
@@ -688,7 +936,9 @@ def _to_epoch_ns(value) -> int | None:
     return int(v)
 
 
-def _export_provider_call_to_collector(span, provider: str, provider_log_id: str) -> int:
+def _export_provider_call_to_collector(
+    span, provider: str, provider_log_id: str
+) -> int:
     """Emit a pulled call's CONVERSATION span to the fi-collector, which writes it to CH ``spans``/``traces``.
 
     Returns the count `emit_spans_to_collector` acknowledged (0 on any early
@@ -913,7 +1163,9 @@ def process_and_store_logs(
 
         # Emit to the fi-collector: it writes CH `spans`/`traces` (the read store)
         # AND meters ingestion usage, so there is no app-side CH write or usage emit.
-        exported = _export_provider_call_to_collector(span, provider.provider, provider_log_id)
+        exported = _export_provider_call_to_collector(
+            span, provider.provider, provider_log_id
+        )
         if exported and exported > 0:
             stored += 1
         else:

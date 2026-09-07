@@ -1,8 +1,10 @@
+import concurrent.futures
 import math
+import random
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import requests
@@ -18,12 +20,31 @@ logger = structlog.get_logger(__name__)
 VAPI_PAGE_LIMIT = 100
 VAPI_MAX_PAGES = 10
 OBSERVABILITY_VERIFY_TIMEOUT_SECONDS = 30
-RETELL_LIST_PAGE_LIMIT = 1000
+RETELL_LIST_PAGE_LIMIT = 100
 RETELL_REQUEST_TIMEOUT_SECONDS = 30
 RETELL_MAX_ATTEMPTS = 3
+RETELL_HYDRATION_WORKERS = 4
+RETELL_RETRY_AFTER_CAP_SECONDS = 30
 
 # Module-level so it stays patchable.
 _sleep = time.sleep
+
+
+def _retell_retry_after_seconds(response: requests.Response) -> float | None:
+    """Parse a 429's ``Retry-After`` header (seconds only), capped at
+    RETELL_RETRY_AFTER_CAP_SECONDS. Returns None when absent, malformed, negative,
+    or non-finite (``nan`` or ``inf``; an HTTP-date string is also non-numeric and
+    treated as absent — date parsing is intentionally not implemented)."""
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(seconds, RETELL_RETRY_AFTER_CAP_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -290,10 +311,14 @@ class ObservabilityService:
     def _retell_request(method: str, url: str, **kwargs: Any) -> requests.Response:
         """One retry helper for every Retell HTTP call.
 
-        429 / 5xx / connection or timeout errors retry up to RETELL_MAX_ATTEMPTS,
-        sleeping 1s then 2s via the module-level ``_sleep``. 401/403 raise at
-        once. Every other non-2xx raises via ``raise_for_status`` (so any
-        ``requests.HTTPError`` this raises carries ``.response``).
+        429 / 5xx / connection or timeout errors retry up to RETELL_MAX_ATTEMPTS.
+        The base backoff is 1s then 2s; a 429 honours the response's
+        ``Retry-After`` header (seconds, capped at RETELL_RETRY_AFTER_CAP_SECONDS)
+        instead when present. Every retry sleep adds ``random.uniform(0, 0.5)``
+        jitter (avoids a thundering herd across the hydration pool's workers),
+        via the module-level ``_sleep``. 401/403 raise at once. Every other
+        non-2xx raises via ``raise_for_status`` (so any ``requests.HTTPError``
+        this raises carries ``.response``).
         """
         request_fn = requests.post if method == "post" else requests.get
         attempt = 0
@@ -306,7 +331,7 @@ class ObservabilityService:
             except (requests.ConnectionError, requests.Timeout):
                 if attempt >= RETELL_MAX_ATTEMPTS:
                     raise
-                _sleep(1 if attempt == 1 else 2)
+                _sleep((1 if attempt == 1 else 2) + random.uniform(0, 0.5))
                 continue
 
             if response.status_code in (401, 403):
@@ -314,7 +339,12 @@ class ObservabilityService:
 
             retryable = response.status_code == 429 or response.status_code >= 500
             if retryable and attempt < RETELL_MAX_ATTEMPTS:
-                _sleep(1 if attempt == 1 else 2)
+                base_delay = 1 if attempt == 1 else 2
+                if response.status_code == 429:
+                    retry_after = _retell_retry_after_seconds(response)
+                    if retry_after is not None:
+                        base_delay = retry_after
+                _sleep(base_delay + random.uniform(0, 0.5))
                 continue
 
             response.raise_for_status()
@@ -365,9 +395,18 @@ class ObservabilityService:
     def _hydrate_retell_calls(
         items: list[dict[str, Any]], headers: dict[str, str]
     ) -> tuple[list[dict[str, Any]], int, int, int]:
-        """Hydrate every list item; drop and count items that never yield a usable call."""
+        """Hydrate every list item; drop and count items that never yield a usable call.
+
+        Detail requests for one page run through a bounded thread pool
+        (RETELL_HYDRATION_WORKERS) so a large page's serial Get Call calls
+        cannot alone exhaust the activity deadline. Results are consumed in
+        the order Retell returned them, so the dedup rule below (last
+        call_id wins) is unaffected by concurrency. A 401/403 from any item
+        still fails the whole page, but only once every submitted request
+        has finished (the pool is never cancelled early).
+        """
         dropped_no_end = dropped_missing = dropped_failed = 0
-        by_call_id: dict[str, dict[str, Any]] = {}
+        candidates: list[tuple[str, dict[str, Any]]] = []
         for item in items:
             if not isinstance(item, dict):
                 # A malformed envelope entry, not a per-call HTTP outcome.
@@ -382,19 +421,36 @@ class ObservabilityService:
                 # Retell-confirmed unknown id, since retrying never helps either.
                 dropped_missing += 1
                 continue
-            merged, reason = ObservabilityService._fetch_retell_call_detail(
-                item, headers
+            candidates.append((call_id, item))
+
+        by_call_id: dict[str, dict[str, Any]] = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=RETELL_HYDRATION_WORKERS
+        ) as executor:
+            results = executor.map(
+                lambda pair: ObservabilityService._fetch_retell_call_detail(
+                    pair[1], headers
+                ),
+                candidates,
             )
-            if reason == "missing":
-                dropped_missing += 1
-                continue
-            if reason == "failed":
-                dropped_failed += 1
-                continue
-            # Key off the list item's own id, not the merged one: a detail body
-            # can only ever add fields, never replace an already-hashable key.
-            by_call_id[call_id] = merged
-        return list(by_call_id.values()), dropped_no_end, dropped_missing, dropped_failed
+            for (call_id, _item), (merged, reason) in zip(
+                candidates, results, strict=True
+            ):
+                if reason == "missing":
+                    dropped_missing += 1
+                    continue
+                if reason == "failed":
+                    dropped_failed += 1
+                    continue
+                # Key off the list item's own id, not the merged one: a detail
+                # body can only ever add fields, never replace an already-hashable key.
+                by_call_id[call_id] = merged
+        return (
+            list(by_call_id.values()),
+            dropped_no_end,
+            dropped_missing,
+            dropped_failed,
+        )
 
     @staticmethod
     def _resolve_retell_key(provider: ObservabilityProvider) -> tuple[str, str]:
@@ -405,8 +461,10 @@ class ObservabilityService:
         """
         try:
             agent = provider.agent_definition
-        except AgentDefinition.DoesNotExist:
-            raise RetellConfigurationError("Retell observability needs a linked agent")
+        except AgentDefinition.DoesNotExist as exc:
+            raise RetellConfigurationError(
+                "Retell observability needs a linked agent"
+            ) from exc
 
         rows = (
             ProviderCredentials.objects.filter(
@@ -427,8 +485,10 @@ class ObservabilityService:
         chosen = rows.first() or legacy
         try:
             key = chosen.get_api_key() if chosen else (agent.api_key or None)
-        except ValueError:
-            raise RetellConfigurationError("Retell credential could not be decrypted")
+        except ValueError as exc:
+            raise RetellConfigurationError(
+                "Retell credential could not be decrypted"
+            ) from exc
         if not key:
             raise RetellConfigurationError(
                 "Retell API key is not configured for this agent"
@@ -450,9 +510,12 @@ class ObservabilityService:
     ) -> RetellPage:
         """Fetch exactly ONE Retell list-calls page, fully hydrated.
 
-        Bootstrap mode: ``start_time is None``. Offset mode: ``skip is not
-        None``. Cursor mode: everything else (windowed, page 1 included).
-        Knows nothing about watermarks or storage; never writes provider state.
+        Modes are defined by request shape, independent of bootstrap vs
+        windowed: offset mode = ``skip is not None``; cursor mode =
+        everything else (bootstrap or windowed, page 1 included). Bootstrap
+        mode (``start_time is None``) pages the same as windowed mode, under
+        the same one-of ``pagination_key``/``skip`` rule. Knows nothing about
+        watermarks or storage; never writes provider state.
         """
         if end_time is None or end_time.tzinfo is None:
             raise RetellConfigurationError("Retell fetch needs an aware end_time")
@@ -461,10 +524,6 @@ class ObservabilityService:
         if start_time is not None and start_time >= end_time:
             raise RetellConfigurationError("Retell fetch window is empty")
         bootstrap = start_time is None
-        if bootstrap and (pagination_key is not None or skip is not None):
-            raise RetellConfigurationError(
-                "Retell bootstrap mode takes no pagination cursor or offset"
-            )
         if pagination_key is not None and skip is not None:
             raise RetellConfigurationError(
                 "Retell fetch cannot use both a pagination cursor and an offset"
@@ -483,8 +542,16 @@ class ObservabilityService:
                 "limit": RETELL_LIST_PAGE_LIMIT,
                 "filter_criteria": {
                     "agent": [{"agent_id": assistant_id}],
-                    "call_status": {"type": "enum", "op": "in", "value": ["ended", "error"]},
-                    "end_timestamp": {"type": "range", "op": "bt", "value": [0, end_ms]},
+                    "call_status": {
+                        "type": "enum",
+                        "op": "in",
+                        "value": ["ended", "error"],
+                    },
+                    "end_timestamp": {
+                        "type": "range",
+                        "op": "bt",
+                        "value": [0, end_ms],
+                    },
                 },
             }
         else:
@@ -494,14 +561,24 @@ class ObservabilityService:
                 "limit": RETELL_LIST_PAGE_LIMIT,
                 "filter_criteria": {
                     "agent": [{"agent_id": assistant_id}],
-                    "call_status": {"type": "enum", "op": "in", "value": ["ended", "error"]},
-                    "end_timestamp": {"type": "range", "op": "bt", "value": [start_ms - 1, end_ms]},
+                    "call_status": {
+                        "type": "enum",
+                        "op": "in",
+                        "value": ["ended", "error"],
+                    },
+                    "end_timestamp": {
+                        "type": "range",
+                        "op": "bt",
+                        "value": [start_ms - 1, end_ms],
+                    },
                 },
             }
-            if pagination_key is not None:
-                body["pagination_key"] = pagination_key
-            elif skip is not None:
-                body["skip"] = skip
+        # Literal placement is the same in every mode, bootstrap included: at
+        # most one of the two optional top-level keys is ever present.
+        if pagination_key is not None:
+            body["pagination_key"] = pagination_key
+        elif skip is not None:
+            body["skip"] = skip
 
         has_cursor_or_offset = pagination_key is not None or skip is not None
         try:
@@ -521,14 +598,16 @@ class ObservabilityService:
         has_more = bool(payload.get("has_more"))
         raw_key = payload.get("pagination_key")
 
+        # Offset mode (any mode, bootstrap included) never yields a cursor.
+        # Everything else is cursor mode, bootstrap page 1 included: a
+        # missing/empty key on a has_more response is a rejected cursor.
         offset_mode = skip is not None
-        cursor_mode = not bootstrap and not offset_mode
-        if cursor_mode:
+        if offset_mode:
+            next_key = None
+        else:
             if has_more and not raw_key:
                 raise RetellCursorRejected(cause="missing_key")
             next_key = raw_key if has_more else None
-        else:
-            next_key = None
 
         items = payload.get("items") or []
         calls, dropped_no_end, dropped_missing, dropped_failed = (
@@ -884,7 +963,7 @@ class ObservabilityService:
                             "role": message.get("role"),
                             "content": message.get("message"),
                             "time": datetime.fromtimestamp(
-                                message.get("time") / 1000, tz=timezone.utc
+                                message.get("time") / 1000, tz=UTC
                             ).isoformat(),
                             "duration": round(duration, 2) if duration else None,
                         }
@@ -979,12 +1058,12 @@ class ObservabilityService:
             else None
         )
         started_at = (
-            datetime.fromtimestamp(started_at_timestamp, tz=timezone.utc).isoformat()
+            datetime.fromtimestamp(started_at_timestamp, tz=UTC).isoformat()
             if started_at_timestamp
             else None
         )
         ended_at = (
-            datetime.fromtimestamp(ended_at_timestamp, tz=timezone.utc).isoformat()
+            datetime.fromtimestamp(ended_at_timestamp, tz=UTC).isoformat()
             if ended_at_timestamp
             else None
         )
@@ -1259,7 +1338,7 @@ class ObservabilityService:
         metadata = raw_log.get("metadata") or {}
         started_at = None
         if start_unix := metadata.get("start_time_unix_secs"):
-            started_at = datetime.fromtimestamp(start_unix, tz=timezone.utc).isoformat()
+            started_at = datetime.fromtimestamp(start_unix, tz=UTC).isoformat()
 
         transcripts = [
             {

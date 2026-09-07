@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -20,19 +20,31 @@ from django.db.models import Q
 from structlog.testing import capture_logs
 
 from tracer.models.observability_provider import ProviderChoices
-from tracer.services.observability_providers import RetellConfigurationError, RetellCursorRejected, RetellPage
+from tracer.services.observability_providers import (
+    RetellConfigurationError,
+    RetellCursorRejected,
+    RetellPage,
+)
 from tracer.utils import observability_provider as op
 
 pytestmark = pytest.mark.unit
 
-UTC = dt_timezone.utc
+UTC = UTC
 
 
 def _dt(*args, **kwargs) -> datetime:
     return datetime(*args, tzinfo=UTC, **kwargs)
 
 
-def _page(calls=None, *, has_more=False, next_key=None, dropped_no_end=0, dropped_missing=0, dropped_failed=0) -> RetellPage:
+def _page(
+    calls=None,
+    *,
+    has_more=False,
+    next_key=None,
+    dropped_no_end=0,
+    dropped_missing=0,
+    dropped_failed=0,
+) -> RetellPage:
     return RetellPage(
         calls=calls or [],
         has_more=has_more,
@@ -61,7 +73,9 @@ class _FakeRow:
     last_fetched_at: datetime | None = None
     enabled: bool = True
     provider: str = ProviderChoices.RETELL
-    deleted: bool = False  # soft-delete flag: `objects` hides it, `all_objects` must not
+    deleted: bool = (
+        False  # soft-delete flag: `objects` hides it, `all_objects` must not
+    )
 
 
 def _q_matches(row: _FakeRow, node) -> bool:
@@ -159,8 +173,16 @@ class _FakeManager:
 @pytest.fixture
 def fake_table(monkeypatch):
     table: dict[object, _FakeRow] = {}
-    monkeypatch.setattr(op.ObservabilityProvider, "all_objects", _FakeManager(table, soft_delete_filter=False))
-    monkeypatch.setattr(op.ObservabilityProvider, "objects", _FakeManager(table, soft_delete_filter=True))
+    monkeypatch.setattr(
+        op.ObservabilityProvider,
+        "all_objects",
+        _FakeManager(table, soft_delete_filter=False),
+    )
+    monkeypatch.setattr(
+        op.ObservabilityProvider,
+        "objects",
+        _FakeManager(table, soft_delete_filter=True),
+    )
     return table
 
 
@@ -182,6 +204,31 @@ def _freeze_now(monkeypatch, when: datetime):
     monkeypatch.setattr(op.timezone, "now", lambda: when)
 
 
+def _freeze_now_then_over_budget(monkeypatch, when: datetime):
+    """`timezone.now()` returns `when` on its FIRST call and
+    `when + RETELL_RUN_BUDGET` (well past the F2 per-run budget) on every
+    call after that — within one call to this helper; call it again fresh
+    before each `_poll_retell_provider` invocation that needs it, it does not
+    accumulate across invocations.
+
+    Use where a fake fetch returns identical ``has_more=True`` content on
+    every call and the test's intent (predating the F2 budget loop) is "one
+    page is stored and checkpointed, then the run returns": under a
+    genuinely frozen clock the new budget loop would instead fetch a second,
+    byte-identical page in the SAME run and hit a spurious page_repeated
+    restart. Reproducing "the budget happened to run out after this one
+    (slow) page" is the faithful way to keep that single-page-per-run
+    behaviour without weakening what the test actually checks.
+    """
+    calls = {"n": 0}
+
+    def fake_now():
+        calls["n"] += 1
+        return when if calls["n"] == 1 else when + op.RETELL_RUN_BUDGET
+
+    monkeypatch.setattr(op.timezone, "now", fake_now)
+
+
 # --------------------------------------------------------------------------
 # Writers
 # --------------------------------------------------------------------------
@@ -198,7 +245,10 @@ def test_write_retell_state_merges_and_preserves_other_top_level_keys(fake_table
     fake_table[pid] = _FakeRow(id=pid, poll_state={"other_key": "kept"})
     ok = op._write_retell_state(pid, {"bootstrapped": True})
     assert ok
-    assert fake_table[pid].poll_state == {"other_key": "kept", "retell": {"bootstrapped": True}}
+    assert fake_table[pid].poll_state == {
+        "other_key": "kept",
+        "retell": {"bootstrapped": True},
+    }
 
 
 def test_write_retell_state_skipped_logs_and_returns_false(fake_table):
@@ -206,7 +256,13 @@ def test_write_retell_state_skipped_logs_and_returns_false(fake_table):
     with capture_logs() as cap:
         ok = op._write_retell_state(pid, {"bootstrapped": True})
     assert ok is False
-    assert cap == [{"event": "provider_poll_state_write_skipped", "log_level": "error", "provider_id": str(pid)}]
+    assert cap == [
+        {
+            "event": "provider_poll_state_write_skipped",
+            "log_level": "error",
+            "provider_id": str(pid),
+        }
+    ]
 
 
 def test_advance_watermark_is_monotonic(fake_table):
@@ -244,7 +300,9 @@ def test_writers_update_a_soft_deleted_row_via_all_objects(fake_table):
     # `objects` manager hides `deleted=True` rows, so the update would match
     # 0 rows and every assertion below would see the pre-write values.
     pid = uuid.uuid4()
-    fake_table[pid] = _FakeRow(id=pid, last_fetched_at=_dt(2026, 1, 1), poll_state={}, deleted=True)
+    fake_table[pid] = _FakeRow(
+        id=pid, last_fetched_at=_dt(2026, 1, 1), poll_state={}, deleted=True
+    )
 
     # `objects` (soft-delete-filtered) must not see this row at all.
     with pytest.raises(op.ObservabilityProvider.DoesNotExist):
@@ -253,8 +311,12 @@ def test_writers_update_a_soft_deleted_row_via_all_objects(fake_table):
     assert op._advance_watermark(pid, _dt(2026, 1, 2)) == 1
     assert fake_table[pid].last_fetched_at == _dt(2026, 1, 2)
 
-    assert op._repair_future_watermark(pid, _dt(2026, 1, 3), _dt(2026, 1, 10)) == 0  # 1/2 is not later than "now" 1/3
-    n = op._repair_future_watermark(pid, _dt(2026, 1, 1), _dt(2026, 1, 4))  # 1/2 IS later than "now" 1/1
+    assert (
+        op._repair_future_watermark(pid, _dt(2026, 1, 3), _dt(2026, 1, 10)) == 0
+    )  # 1/2 is not later than "now" 1/3
+    n = op._repair_future_watermark(
+        pid, _dt(2026, 1, 1), _dt(2026, 1, 4)
+    )  # 1/2 IS later than "now" 1/1
     assert n == 1
     assert fake_table[pid].last_fetched_at == _dt(2026, 1, 4)
 
@@ -294,11 +356,20 @@ def test_backoff_gate_skips_run_before_backoff_until(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     until = now + timedelta(minutes=5)
-    row = _FakeRow(id=pid, poll_state={"retell": {"bootstrapped": True, "backoff_until": until.isoformat()}})
+    row = _FakeRow(
+        id=pid,
+        poll_state={
+            "retell": {"bootstrapped": True, "backoff_until": until.isoformat()}
+        },
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: pytest.fail("must not fetch"))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: pytest.fail("must not fetch"),
+    )
 
     result = op._poll_retell_provider(provider)
     assert result == op.StoreOutcome(0, 0, 0)
@@ -308,12 +379,22 @@ def test_backoff_expired_proceeds(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     until = now - timedelta(minutes=1)
-    row = _FakeRow(id=pid, last_fetched_at=now - timedelta(hours=1), poll_state={"retell": {"bootstrapped": True, "backoff_until": until.isoformat()}})
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=now - timedelta(hours=1),
+        poll_state={
+            "retell": {"bootstrapped": True, "backoff_until": until.isoformat()}
+        },
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page())
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page()
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 0)
+    )
 
     result = op._poll_retell_provider(provider)
     assert result is not None  # not backoff-skipped
@@ -322,12 +403,20 @@ def test_backoff_expired_proceeds(fake_table, monkeypatch):
 def test_backoff_until_non_string_is_ignored(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
-    row = _FakeRow(id=pid, last_fetched_at=now - timedelta(hours=1), poll_state={"retell": {"bootstrapped": True, "backoff_until": 12345}})
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=now - timedelta(hours=1),
+        poll_state={"retell": {"bootstrapped": True, "backoff_until": 12345}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page())
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page()
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 0)
+    )
 
     result = op._poll_retell_provider(provider)
     assert result is not None  # ignored, run proceeds
@@ -338,13 +427,20 @@ def test_backoff_until_non_string_is_ignored(fake_table, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_bootstrap_runs_regardless_of_old_watermark_and_preserves_other_keys_discards_stale_window(fake_table, monkeypatch):
+def test_bootstrap_runs_regardless_of_old_watermark_and_preserves_other_keys_discards_stale_window(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     row = _FakeRow(
         id=pid,
-        last_fetched_at=_dt(2020, 1, 1),  # old watermark: irrelevant, bootstrap runs anyway (D10)
-        poll_state={"other_top_level": "kept", "retell": {"window": {"start": "stale"}}},
+        last_fetched_at=_dt(
+            2020, 1, 1
+        ),  # old watermark: irrelevant, bootstrap runs anyway (D10)
+        poll_state={
+            "other_top_level": "kept",
+            "retell": {"window": {"start": "stale"}},
+        },
     )
     fake_table[pid] = row
     provider = _retell_provider(row)
@@ -356,15 +452,193 @@ def test_bootstrap_runs_regardless_of_old_watermark_and_preserves_other_keys_dis
         return _page(_calls(3))
 
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(3, 0, 0))
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(3, 0, 0)
+    )
 
     outcome = op._poll_retell_provider(provider)
 
     assert outcome == op.StoreOutcome(3, 0, 0)
     assert seen_bounds == [(None, now - op.RETELL_VISIBILITY_LAG)]
     assert fake_table[pid].poll_state["other_top_level"] == "kept"
-    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}  # stale window discarded
+    assert fake_table[pid].poll_state["retell"] == {
+        "bootstrapped": True
+    }  # stale window discarded
     assert fake_table[pid].last_fetched_at == now - op.RETELL_VISIBILITY_LAG
+
+
+def test_bootstrap_discards_a_valid_stale_ordinary_window_not_just_an_invalid_one(
+    fake_table, monkeypatch
+):
+    # F5/R1 L1: v1.13 §7 says a stale `window` is discarded when `bootstrapped`
+    # is falsy — the test above only pins this for an INVALID window (missing
+    # keys). A *valid* ordinary window (a real "start") must also be
+    # discarded and a fresh bootstrap window opened, not adopted as-is: an
+    # adopted ordinary window would run windowed logic (RETELL_MAX_PAGES_PER_WINDOW,
+    # the hint machinery, an early watermark advance) while `bootstrapped` is
+    # still unset.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    stale_start = now - timedelta(hours=5)
+    valid_ordinary_window = {
+        "start": stale_start.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "stale-cursor",
+        "skip": None,
+        "pages_stored": 2,
+        "total_pages": 2,
+        "digests": ["deadbeef"],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        poll_state={"retell": {"window": valid_ordinary_window}},
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(monkeypatch, now)
+    seen_bounds = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        seen_bounds.append((start, end, pagination_key))
+        return _page(_calls(1), has_more=False)
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    # A fresh bootstrap window was opened (start None, key None) — the stale
+    # ordinary window's "stale-cursor" key/bounds must never reach the fetch.
+    assert seen_bounds == [(None, now - op.RETELL_VISIBILITY_LAG, None)]
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+
+
+def test_bootstrap_resumes_its_own_stale_bootstrap_window_instead_of_discarding_it(
+    fake_table, monkeypatch
+):
+    # F5: the discard rule has one exception — a window that is ITSELF a
+    # bootstrap window (start is None) is resumed, not thrown away.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    frozen_end = (
+        now - timedelta(hours=3)
+    ).isoformat()  # a much earlier run's frozen end
+    bootstrap_window = {
+        "start": None,
+        "end": frozen_end,
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "resume-me",
+        "skip": None,
+        "pages_stored": 2,
+        "total_pages": 2,
+        "digests": ["deadbeef"],
+        "restarts": 0,
+    }
+    row = _FakeRow(id=pid, poll_state={"retell": {"window": bootstrap_window}})
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(monkeypatch, now)
+    seen = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        seen.append((start, end, pagination_key))
+        return _page(_calls(1), has_more=False)
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    op._poll_retell_provider(provider)
+
+    assert seen == [(None, op._parse(frozen_end), "resume-me")]  # resumed, not reopened
+
+
+def test_v1_13_persisted_window_without_total_pages_is_resumed_not_discarded(
+    fake_table, monkeypatch
+):
+    # F4/N5: a window persisted by v1.13, before B7 added "total_pages", has
+    # no such key and would otherwise fail `_valid_window` on deploy — the
+    # window would be silently discarded and its range re-listed from
+    # `last_fetched_at` instead of resumed. `_backfill_total_pages` must set
+    # it (from `pages_stored`) BEFORE validation runs, so the window resumes.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    v1_13_window = {
+        "start": (now - timedelta(minutes=30)).isoformat(),
+        "end": (now - op.RETELL_VISIBILITY_LAG).isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "v1-13-cursor",
+        "skip": None,
+        "pages_stored": 2,
+        # deliberately no "total_pages" key: this is exactly the v1.13 shape
+        "digests": ["deadbeef"],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={"retell": {"bootstrapped": True, "window": v1_13_window}},
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    # Frozen-then-over-budget: the fake fetch below returns byte-identical
+    # content on every call, so a genuinely frozen clock would let the F2
+    # budget loop try a second, identical page in this same run and hit a
+    # spurious page_repeated restart — see `_freeze_now_then_over_budget`.
+    # This test only cares about the ONE page's resume-then-persist outcome.
+    _freeze_now_then_over_budget(monkeypatch, now)
+    seen = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        seen.append((start, end, pagination_key))
+        return _page(_calls(1, "new"), has_more=True, next_key="v1-13-cursor-2")
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    op._poll_retell_provider(provider)
+
+    # Resumed from the persisted cursor and window bounds — NOT reopened from
+    # `last_fetched_at`, which would have queried `(wm, end)` instead.
+    assert seen == [
+        (
+            op._parse(v1_13_window["start"]),
+            op._parse(v1_13_window["end"]),
+            "v1-13-cursor",
+        )
+    ]
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert (
+        window["total_pages"] == 3
+    )  # backfilled from pages_stored=2, then incremented
+    assert window["pages_stored"] == 3
+
+
+def test_backfill_total_pages_is_a_noop_when_the_key_is_already_present():
+    # F4: a window already carrying "total_pages" (B7-and-later) must not
+    # have it overwritten by the backfill.
+    window = {"pages_stored": 5, "total_pages": 9}
+    op._backfill_total_pages(window)
+    assert window["total_pages"] == 9
+
+
+def test_backfill_total_pages_ignores_non_dict_input():
+    # F4: called unconditionally ahead of `_valid_window`, so it must not
+    # raise on `None` or any other malformed value already handled downstream.
+    op._backfill_total_pages(None)
+    op._backfill_total_pages("not-a-window")
 
 
 def test_bootstrap_has_more_is_logged_not_raised(fake_table, monkeypatch):
@@ -373,9 +647,19 @@ def test_bootstrap_has_more_is_logged_not_raised(fake_table, monkeypatch):
     row = _FakeRow(id=pid, poll_state={})
     fake_table[pid] = row
     provider = _retell_provider(row)
-    _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1000), has_more=True, next_key=None))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1000, 0, 0))
+    # F2: the fake fetch below returns byte-identical content on every call;
+    # a genuinely frozen clock would let the new budget loop try a second,
+    # identical page in the same run and hit a spurious page_repeated
+    # restart. This test only cares about one page's outcome/logging.
+    _freeze_now_then_over_budget(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1000), has_more=True, next_key=None),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1000, 0, 0)
+    )
 
     with capture_logs() as cap:
         outcome = op._poll_retell_provider(provider)  # must not raise
@@ -384,11 +668,22 @@ def test_bootstrap_has_more_is_logged_not_raised(fake_table, monkeypatch):
     # §7: "bootstrap with has_more logged" — the counts event must actually
     # carry has_more=True, not just fail to raise.
     counts_events = [e for e in cap if e["event"] == "retell_poll_counts"]
-    assert counts_events == [{
-        "event": "retell_poll_counts", "log_level": "info", "provider_id": str(pid), "mode": "bootstrap",
-        "pages_stored": 0, "stored": 1000, "malformed": 0, "export_failed": 0,
-        "dropped_no_end": 0, "dropped_missing": 0, "dropped_failed": 0, "has_more": True,
-    }]
+    assert counts_events == [
+        {
+            "event": "retell_poll_counts",
+            "log_level": "info",
+            "provider_id": str(pid),
+            "mode": "bootstrap",
+            "pages_stored": 0,
+            "stored": 1000,
+            "malformed": 0,
+            "export_failed": 0,
+            "dropped_no_end": 0,
+            "dropped_missing": 0,
+            "dropped_failed": 0,
+            "has_more": True,
+        }
+    ]
 
 
 def test_bootstrap_partial_twice_then_abandoned_on_third(fake_table, monkeypatch):
@@ -397,9 +692,13 @@ def test_bootstrap_partial_twice_then_abandoned_on_third(fake_table, monkeypatch
     row = _FakeRow(id=pid, poll_state={})
     fake_table[pid] = row
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1)))
+    monkeypatch.setattr(
+        op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1))
+    )
     # partial: some stored, one export_failed
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 1))
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 1)
+    )
 
     for i in range(1, 3):
         provider = _retell_provider(row)
@@ -416,8 +715,13 @@ def test_bootstrap_partial_twice_then_abandoned_on_third(fake_table, monkeypatch
     # pins impl L324-329's `logger.error("retell_page_abandoned", ...)` in the
     # bootstrap abandon branch — deleting/renaming that call leaves every
     # state/return-value assertion above unchanged, so only the event proves it fired.
-    assert {"event": "retell_page_abandoned", "log_level": "error", "provider_id": str(pid),
-            "abandoned": 1, "failed_runs": 3} in cap
+    assert {
+        "event": "retell_page_abandoned",
+        "log_level": "error",
+        "provider_id": str(pid),
+        "abandoned": 1,
+        "failed_runs": 3,
+    } in cap
 
 
 def test_bootstrap_total_failure_backs_off_and_sets_no_marker(fake_table, monkeypatch):
@@ -427,8 +731,12 @@ def test_bootstrap_total_failure_backs_off_and_sets_no_marker(fake_table, monkey
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page())
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 500))
+    monkeypatch.setattr(
+        op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page()
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 500)
+    )
 
     result = op._poll_retell_provider(provider)
     assert result is None
@@ -439,20 +747,798 @@ def test_bootstrap_total_failure_backs_off_and_sets_no_marker(fake_table, monkey
 
 
 # --------------------------------------------------------------------------
+# Bootstrap paging / checkpointing (amendment v1.14: B1-B3)
+# --------------------------------------------------------------------------
+
+
+def test_bootstrap_page_one_has_more_persists_window_marker_not_set(
+    fake_table, monkeypatch
+):
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _FakeRow(id=pid, poll_state={})
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    # F2: identical content on every call — see the comment on
+    # _freeze_now_then_over_budget for why a plain frozen clock would break
+    # this "exactly one page this run" assertion.
+    _freeze_now_then_over_budget(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(5), has_more=True, next_key="page-2-key"),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(5, 0, 0)
+    )
+
+    outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(5, 0, 0)
+    retell_state = fake_table[pid].poll_state["retell"]
+    assert "bootstrapped" not in retell_state
+    window = retell_state["window"]
+    assert window["start"] is None
+    assert window["key"] == "page-2-key"
+    assert window["pages_stored"] == 1
+    assert (
+        fake_table[pid].last_fetched_at is None
+    )  # untouched until bootstrap completes
+
+
+def test_bootstrap_completes_on_second_page_marker_set_watermark_is_first_run_end(
+    fake_table, monkeypatch
+):
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _FakeRow(id=pid, poll_state={})
+    fake_table[pid] = row
+    # F2: identical content on every call — see _freeze_now_then_over_budget.
+    _freeze_now_then_over_budget(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "p1"), has_more=True, next_key="cursor-1"),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    provider = _retell_provider(row)
+    outcome = op._poll_retell_provider(provider)
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert fake_table[pid].last_fetched_at is None
+    frozen_end = fake_table[pid].poll_state["retell"]["window"]["end"]
+
+    # A later run: "now" moves on, but the bootstrap window's frozen end must not.
+    later = now + timedelta(hours=2)
+    _freeze_now(monkeypatch, later)
+    seen = []
+
+    def resume_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        seen.append((start, end, pagination_key))
+        return _page(_calls(1, "p2"), has_more=False)
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", resume_fetch)
+    provider = _retell_provider(fake_table[pid])
+    outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert seen == [(None, op._parse(frozen_end), "cursor-1")]
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+    assert fake_table[pid].last_fetched_at == op._parse(frozen_end)
+
+
+def test_bootstrap_capped_at_max_pages_completes(fake_table, monkeypatch):
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    # F6: frozen_end deliberately differs from `now - RETELL_VISIBILITY_LAG`
+    # (the CURRENT run's end) so a completion that wrote the wrong end
+    # (this run's, not the first bootstrap run's) would fail the assertion below.
+    frozen_end = (now - timedelta(hours=2) - op.RETELL_VISIBILITY_LAG).isoformat()
+    row = _FakeRow(
+        id=pid,
+        poll_state={
+            "retell": {
+                "window": {
+                    "start": None,
+                    "end": frozen_end,
+                    "opened_at_hint": False,
+                    "narrowed": False,
+                    "key": "cursor-9",
+                    "skip": None,
+                    "pages_stored": op.RETELL_BOOTSTRAP_MAX_PAGES - 1,
+                    "total_pages": op.RETELL_BOOTSTRAP_MAX_PAGES - 1,
+                    "digests": [],
+                    "restarts": 0,
+                }
+            }
+        },
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "last"), has_more=True, next_key="cursor-10"),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+    assert fake_table[pid].last_fetched_at == op._parse(frozen_end)
+    assert (
+        {
+            "event": "retell_bootstrap_capped",
+            "log_level": "info",
+            "provider_id": str(pid),
+            "pages_stored": op.RETELL_BOOTSTRAP_MAX_PAGES,
+            "total_pages": op.RETELL_BOOTSTRAP_MAX_PAGES,  # F7/N8: no restart in this run, so equal to pages_stored
+        }
+        in cap
+    )
+
+
+def test_bootstrap_capped_counts_total_pages_across_a_restart(fake_table, monkeypatch):
+    # F1/H1: RETELL_BOOTSTRAP_MAX_PAGES must bound `total_pages`, which
+    # `_restart_window` never resets — not `pages_stored`, which it zeroes on
+    # every restart. Store pages up to one below the cap, force a restart
+    # (which zeroes pages_stored back to 0 but must leave total_pages alone),
+    # then store one more page: the cap must still fire at the (restart-spanning) total.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _FakeRow(id=pid, poll_state={})
+    fake_table[pid] = row
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    # Store pages until one below the cap. Each page's content is unique (p0,
+    # p1, ...) so the unrelated digest-repeat restart guard never fires — a
+    # repeated call_id across separate simulated runs would trip that
+    # invariant regardless of F1/F2. Each iteration re-freezes the clock
+    # (over-budget-after-one-page) so the F2 run-budget loop does not itself
+    # try a second page inside a single `_poll_retell_provider` call.
+    for i in range(op.RETELL_BOOTSTRAP_MAX_PAGES - 1):
+        monkeypatch.setattr(
+            op.ObservabilityService,
+            "fetch_retell_page",
+            lambda *a, i=i, **k: _page(
+                _calls(1, f"p{i}"), has_more=True, next_key=f"k{i}"
+            ),
+        )
+        _freeze_now_then_over_budget(monkeypatch, now)
+        provider = _retell_provider(fake_table[pid])
+        op._poll_retell_provider(provider)
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["total_pages"] == op.RETELL_BOOTSTRAP_MAX_PAGES - 1
+    assert window["pages_stored"] == op.RETELL_BOOTSTRAP_MAX_PAGES - 1
+
+    # Force a restart: pages_stored/key/digests reset, total_pages untouched.
+    def raise_rejected(*a, **k):
+        raise RetellCursorRejected(cause="missing_key")
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", raise_rejected)
+    _freeze_now(monkeypatch, now)
+    provider = _retell_provider(fake_table[pid])
+    op._poll_retell_provider(provider)
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["pages_stored"] == 0  # reset by the restart
+    assert window["total_pages"] == op.RETELL_BOOTSTRAP_MAX_PAGES - 1  # NOT reset
+
+    # One more stored page reaches the cap (counting across the restart, not
+    # from the post-restart pages_stored=0), so this run must complete.
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "last"), has_more=True, next_key="k-last"),
+    )
+    _freeze_now_then_over_budget(monkeypatch, now)
+    provider = _retell_provider(fake_table[pid])
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+    # F7/N8: pages_stored alone would misleadingly read 1 here (reset by the
+    # restart above) — total_pages is the field that actually reached the cap.
+    capped_events = [e for e in cap if e["event"] == "retell_bootstrap_capped"]
+    assert len(capped_events) == 1
+    assert capped_events[0]["pages_stored"] == 1
+    assert capped_events[0]["total_pages"] == op.RETELL_BOOTSTRAP_MAX_PAGES
+
+
+def test_bootstrap_permanently_broken_pagination_terminates_with_marker_and_first_run_end(
+    fake_table, monkeypatch
+):
+    # F1/H1: cursor rejected on every page, then offset mode also rejected —
+    # under v1.13 this looped `retell_window_stuck` forever with no marker
+    # ever set (the escalated bug the amendment review flagged). The fix must
+    # terminate the bootstrap instead, with the watermark equal to the FIRST
+    # run's frozen end, not left unset.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _FakeRow(id=pid, poll_state={})
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    first_run_end = now - op.RETELL_VISIBILITY_LAG
+
+    def raise_rejected(*a, **k):
+        raise RetellCursorRejected(cause="missing_key")
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", raise_rejected)
+
+    # F5/N9: advance the clock between simulated runs by more than
+    # RETELL_VISIBILITY_LAG. The window's "end" is frozen on the FIRST run
+    # and must never change; without this advance every run shares the same
+    # `now`, so "complete with the frozen window['end']" and "complete with
+    # THIS run's end" are the same instant and a mutant swapping one for the
+    # other (R1 mutant 3b) would pass undetected.
+    clock = {"now": now}
+
+    def _tick():
+        clock["now"] += op.RETELL_VISIBILITY_LAG * 5
+        _freeze_now(monkeypatch, clock["now"])
+
+    # RETELL_MAX_WINDOW_RESTARTS cursor-mode restarts -> switches to offset mode.
+    for _ in range(op.RETELL_MAX_WINDOW_RESTARTS):
+        provider = _retell_provider(fake_table[pid])
+        assert op._poll_retell_provider(provider) is None
+        _tick()
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["skip"] == 0  # now in offset mode
+
+    # RETELL_MAX_WINDOW_RESTARTS more (offset-mode) restarts, still rejected
+    # every time -> must terminate the bootstrap on the last one instead of
+    # looping "stuck" forever.
+    with capture_logs() as cap:
+        for _ in range(op.RETELL_MAX_WINDOW_RESTARTS - 1):
+            provider = _retell_provider(fake_table[pid])
+            assert op._poll_retell_provider(provider) is None
+            _tick()
+        provider = _retell_provider(fake_table[pid])
+        result = op._poll_retell_provider(provider)
+
+    assert result is None
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+    assert fake_table[pid].last_fetched_at == first_run_end
+    assert {
+        "event": "retell_window_stuck",
+        "log_level": "error",
+        "provider_id": str(pid),
+    } in cap
+
+
+def test_bootstrap_cursor_rejected_three_times_switches_to_offset_mode(
+    fake_table, monkeypatch
+):
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _FakeRow(id=pid, poll_state={})
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+
+    def raise_rejected(*a, **k):
+        raise RetellCursorRejected(cause="missing_key")
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", raise_rejected)
+
+    for _ in range(op.RETELL_MAX_WINDOW_RESTARTS):
+        provider = _retell_provider(fake_table[pid])
+        assert op._poll_retell_provider(provider) is None
+
+    retell_state = fake_table[pid].poll_state["retell"]
+    assert "bootstrapped" not in retell_state
+    window = retell_state["window"]
+    assert window["start"] is None
+    assert (
+        window["skip"] == 0
+    )  # switched to offset mode, no halving (no start to halve)
+    assert window["restarts"] == 0
+    assert (
+        "window_hint_seconds" not in retell_state
+    )  # never written by a bootstrap restart
+
+
+def test_large_page_checkpoints_before_returning_then_resumes_from_cursor(
+    fake_table, monkeypatch
+):
+    # Contract v1.14 C3: a page holding up to RETELL_LIST_PAGE_LIMIT calls,
+    # however slow its hydration, must checkpoint after exactly one page so a
+    # run that dies mid-page loses at most that page. "Slow" is simulated
+    # with a call log, never a real sleep.
+    assert (
+        op.RETELL_LIST_PAGE_LIMIT == 100
+    )  # a future bump is a deliberate contract change
+
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
+    fake_table[pid] = row
+    # F2 (the review fix that lets a run page through several pages within a
+    # wall-clock budget) added a second `timezone.now()` call after a stored
+    # has_more page. This fake returns identical content on every call, so a
+    # genuinely frozen clock would let the run try a second, identical page
+    # in the SAME run and hit a spurious page_repeated restart instead of
+    # returning. Simulating "this one (slow) page alone used the whole
+    # budget" is the faithful way to keep proving the checkpoint-then-return
+    # property C3 asks for.
+    _freeze_now_then_over_budget(monkeypatch, now)
+
+    fetch_calls = []
+
+    def slow_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        fetch_calls.append((start, end, pagination_key, skip))
+        return _page(
+            _calls(op.RETELL_LIST_PAGE_LIMIT, "big"),
+            has_more=True,
+            next_key="resume-cursor",
+        )
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", slow_fetch)
+    monkeypatch.setattr(
+        op,
+        "process_and_store_logs",
+        lambda *a, **k: op.StoreOutcome(op.RETELL_LIST_PAGE_LIMIT, 0, 0),
+    )
+
+    provider = _retell_provider(row)
+    outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(op.RETELL_LIST_PAGE_LIMIT, 0, 0)
+    assert len(fetch_calls) == 1  # exactly one page per run, however large or slow
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["key"] == "resume-cursor"
+    assert window["pages_stored"] == 1
+    assert (
+        fake_table[pid].last_fetched_at == wm
+    )  # not advanced: the window isn't complete
+
+    # A second run resumes from the persisted cursor rather than re-listing.
+    _freeze_now_then_over_budget(monkeypatch, now)
+    provider = _retell_provider(fake_table[pid])
+    op._poll_retell_provider(provider)
+
+    assert len(fetch_calls) == 2
+    assert (
+        fetch_calls[1][2] == "resume-cursor"
+    )  # pagination_key passed through, not None
+
+
+# --------------------------------------------------------------------------
+# Per-run wall-clock budget with per-page checkpointing (v1.14 review fix F2)
+# --------------------------------------------------------------------------
+
+
+def test_run_budget_pages_through_multiple_pages_within_one_run_when_clock_never_advances(
+    fake_table, monkeypatch
+):
+    # F2(a): with a genuinely frozen clock the per-run budget never elapses,
+    # so ONE call to `_poll_retell_provider` pages all the way through to
+    # completion, persisting the checkpoint (cursor) after EACH page along
+    # the way — not just once at the end.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(monkeypatch, now)
+
+    pages = [
+        _page(_calls(1, "p1"), has_more=True, next_key="cursor-1"),
+        _page(_calls(1, "p2"), has_more=True, next_key="cursor-2"),
+        _page(_calls(1, "p3"), has_more=False),
+    ]
+    fetch_calls = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        fetch_calls.append(pagination_key)
+        return pages[len(fetch_calls) - 1]
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    persisted_keys = []
+    real_write = op._write_retell_state
+
+    def spy_write(provider_id, state):
+        persisted_keys.append((state.get("window") or {}).get("key"))
+        return real_write(provider_id, state)
+
+    monkeypatch.setattr(op, "_write_retell_state", spy_write)
+
+    outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert fetch_calls == [None, "cursor-1", "cursor-2"]  # three pages, ONE run
+    # the cursor was checkpointed after each page, not just the last write:
+    assert persisted_keys == ["cursor-1", "cursor-2", None]
+    assert "window" not in fake_table[pid].poll_state["retell"]  # window completed
+    assert fake_table[pid].last_fetched_at is not None
+
+
+def test_run_budget_exceeded_after_one_page_returns_with_cursor_persisted(
+    fake_table, monkeypatch
+):
+    # F2(b): once the per-run budget has elapsed, the run returns after the
+    # page it just checkpointed instead of fetching another, even though
+    # `has_more` is still True.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now_then_over_budget(monkeypatch, now)
+    fetch_calls = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        fetch_calls.append(pagination_key)
+        return _page(
+            _calls(1, f"p{len(fetch_calls)}"),
+            has_more=True,
+            next_key=f"cursor-{len(fetch_calls)}",
+        )
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert (
+        len(fetch_calls) == 1
+    )  # budget exhausted after the first page: no second fetch this run
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["key"] == "cursor-1"
+    assert window["pages_stored"] == 1
+
+
+# --------------------------------------------------------------------------
+# Activity-level deadline (v1.14 review fix F1 / N1): the deadline threaded
+# in from the scheduled fan-out caps the per-run budget from outside.
+# --------------------------------------------------------------------------
+
+
+def test_deadline_in_the_past_stores_at_most_one_page_and_persists_cursor(
+    fake_table, monkeypatch
+):
+    # F1(a): a deadline that has already elapsed by the time the run starts
+    # must behave like the run budget already being exhausted — one page
+    # stored and checkpointed, then return, even though the clock never
+    # advances and `has_more` stays True.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(
+        monkeypatch, now
+    )  # genuinely frozen: only `deadline` can end the run early
+
+    fetch_calls = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        fetch_calls.append(pagination_key)
+        return _page(
+            _calls(1, f"p{len(fetch_calls)}"),
+            has_more=True,
+            next_key=f"cursor-{len(fetch_calls)}",
+        )
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    outcome = op._poll_retell_provider(provider, deadline=now - timedelta(minutes=1))
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert len(fetch_calls) == 1  # deadline already past: no second fetch this run
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["key"] == "cursor-1"
+    assert window["pages_stored"] == 1
+
+
+def test_deadline_far_away_leaves_multi_page_run_unchanged(fake_table, monkeypatch):
+    # F1(b): a deadline far in the future must not itself cap anything — with
+    # the clock genuinely frozen, the run budget governs exactly as it did
+    # before F1, and pages through to completion in one run.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(monkeypatch, now)
+
+    pages = [
+        _page(_calls(1, "p1"), has_more=True, next_key="cursor-1"),
+        _page(_calls(1, "p2"), has_more=True, next_key="cursor-2"),
+        _page(_calls(1, "p3"), has_more=False),
+    ]
+    fetch_calls = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        fetch_calls.append(pagination_key)
+        return pages[len(fetch_calls) - 1]
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    outcome = op._poll_retell_provider(provider, deadline=now + timedelta(hours=5))
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert fetch_calls == [None, "cursor-1", "cursor-2"]  # all three pages, one run
+    assert "window" not in fake_table[pid].poll_state["retell"]  # window completed
+
+
+def test_deadline_none_means_only_the_run_budget_applies(fake_table, monkeypatch):
+    # F1: manual runs / direct callers pass no deadline at all; the run
+    # budget alone must still govern, exactly as before F1 existed.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now_then_over_budget(monkeypatch, now)
+    fetch_calls = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        fetch_calls.append(pagination_key)
+        return _page(
+            _calls(1, f"p{len(fetch_calls)}"),
+            has_more=True,
+            next_key=f"cursor-{len(fetch_calls)}",
+        )
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    outcome = op._poll_retell_provider(provider)  # no deadline kwarg at all
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert len(fetch_calls) == 1
+
+
+def test_fetch_logs_for_provider_wires_the_deadline_to_the_scheduled_poll_only(
+    fake_table, monkeypatch
+):
+    # R3 M1: the second half of the wire. `fetch_logs_for_provider` must hand
+    # the activity deadline to `_poll_retell_provider` unchanged, and the
+    # manual path must never see it (manual runs are page-capped, not
+    # budgeted).
+    pid = uuid.uuid4()
+    fake_table[pid] = _FakeRow(id=pid, poll_state={"retell": {"bootstrapped": True}})
+    deadline = _dt(2026, 1, 1, 14, 0, 0)
+    seen = {}
+
+    def fake_poll(provider, **kwargs):
+        seen["poll"] = kwargs
+        return op.StoreOutcome(0, 0, 0)
+
+    def fake_manual(provider, **kwargs):
+        seen["manual"] = kwargs
+        return op.StoreOutcome(0, 0, 0)
+
+    monkeypatch.setattr(op, "_poll_retell_provider", fake_poll)
+    monkeypatch.setattr(op, "_manual_retell_run", fake_manual)
+
+    op.fetch_logs_for_provider(
+        pid, scheduled=True, start_time=None, end_time=None, deadline=deadline
+    )
+    assert seen == {"poll": {"deadline": deadline}}
+
+    seen.clear()
+    start, end = _dt(2026, 1, 1, 10, 0, 0), _dt(2026, 1, 1, 11, 0, 0)
+    op.fetch_logs_for_provider(
+        pid, scheduled=False, start_time=start, end_time=end, deadline=deadline
+    )
+    assert seen == {"manual": {"start_time": start, "end_time": end}}
+
+
+def test_behind_events_read_a_fresh_clock_not_the_run_start(fake_table, monkeypatch):
+    # R3 L1 (pins F2/N2): a multi-page run that takes real time must report
+    # a growing frontier age after each page, and the completion-time behind
+    # check must see the time the run actually took. With the run-start `now`
+    # every in-loop age would be a constant 60 s and the final check would
+    # never fire.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    wm = now - timedelta(hours=1)
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    clock = {"t": now}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    # Two 8-minute pages stay inside the 20-minute run budget; the third
+    # pushes the frontier age past RETELL_BEHIND_WARN at completion.
+    step = timedelta(minutes=8)
+    pages = [
+        _page(_calls(1, "p1"), has_more=True, next_key="cursor-1"),
+        _page(_calls(1, "p2"), has_more=True, next_key="cursor-2"),
+        _page(_calls(1, "p3"), has_more=False),
+    ]
+    fetch_calls = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+        clock["t"] = clock["t"] + step  # each page takes `step` of wall time
+        fetch_calls.append(pagination_key)
+        return pages[len(fetch_calls) - 1]
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert fetch_calls == [None, "cursor-1", "cursor-2"]
+    ages = [
+        e["frontier_age_seconds"] for e in cap if e["event"] == "retell_poll_behind"
+    ]
+    lag = int(op.RETELL_VISIBILITY_LAG.total_seconds())
+    step_s = int(step.total_seconds())
+    assert ages == [step_s + lag, 2 * step_s + lag, 3 * step_s + lag]
+
+
+# --------------------------------------------------------------------------
+# Mutation guards (v1.14 review fix F6)
+# --------------------------------------------------------------------------
+
+
+def test_write_retell_state_never_precedes_process_and_store_logs_for_a_page(
+    fake_table, monkeypatch
+):
+    # F6(a): B3's checkpoint property requires the store to happen before the
+    # state write, for every page. Every other test only checks the FINAL
+    # state, never the ORDER `process_and_store_logs` and
+    # `_write_retell_state` ran in — a mutation that hoisted the write above
+    # the store (silently reversing B3's loss direction) would survive all of
+    # them undetected.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _FakeRow(id=pid, poll_state={})
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+
+    order = []
+    monkeypatch.setattr(
+        op,
+        "process_and_store_logs",
+        lambda *a, **k: order.append("store") or op.StoreOutcome(1, 0, 0),
+    )
+    real_write = op._write_retell_state
+
+    def spy_write(provider_id, state):
+        order.append("write")
+        return real_write(provider_id, state)
+
+    monkeypatch.setattr(op, "_write_retell_state", spy_write)
+
+    outcome = op._poll_retell_provider(provider)
+
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert order == ["store", "write"]
+
+
+def test_bootstrap_page_cap_check_never_applies_the_ordinary_window_guard(
+    fake_table, monkeypatch
+):
+    # F6(b): RETELL_MAX_PAGES_PER_WINDOW must never gate a bootstrap window —
+    # only RETELL_BOOTSTRAP_MAX_PAGES does. `pages_stored` is set well past
+    # the ORDINARY-window cap on purpose: if a mutation dropped the
+    # `not bootstrap` guard on that check, this page would restart
+    # (page_cap) before ever being stored, instead of completing normally
+    # through the bootstrap total_pages cap as it must.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    frozen_end = (now - op.RETELL_VISIBILITY_LAG).isoformat()
+    window = {
+        "start": None,
+        "end": frozen_end,
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "cursor-x",
+        "skip": None,
+        "pages_stored": op.RETELL_MAX_PAGES_PER_WINDOW,  # > the ORDINARY-window cap
+        "total_pages": op.RETELL_BOOTSTRAP_MAX_PAGES - 1,  # one below the BOOTSTRAP cap
+        "digests": [],
+        "restarts": 0,
+    }
+    row = _FakeRow(id=pid, poll_state={"retell": {"window": window}})
+    fake_table[pid] = row
+    provider = _retell_provider(row)
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            _calls(1, "over-window-cap"), has_more=True, next_key="cursor-y"
+        ),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(provider)
+
+    # Stored and completed via the BOOTSTRAP cap — never restarted via the
+    # ordinary-window "page_cap" guard.
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+    assert fake_table[pid].last_fetched_at == op._parse(frozen_end)
+    assert not [e for e in cap if e["event"] == "retell_window_restarted"]
+    assert any(e["event"] == "retell_bootstrap_capped" for e in cap)
+
+
+# --------------------------------------------------------------------------
 # Windowed runs
 # --------------------------------------------------------------------------
 
 
-def test_windowed_single_page_pops_window_and_advances_watermark(fake_table, monkeypatch):
+def test_windowed_single_page_pops_window_and_advances_watermark(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(2), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(2, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(2), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(2, 0, 0)
+    )
 
     outcome = op._poll_retell_provider(provider)
     assert outcome == op.StoreOutcome(2, 0, 0)
@@ -460,7 +1546,9 @@ def test_windowed_single_page_pops_window_and_advances_watermark(fake_table, mon
     assert fake_table[pid].last_fetched_at == now - op.RETELL_VISIBILITY_LAG
 
 
-def test_retell_page_all_malformed_logged_when_ok_verdict_has_zero_stored(fake_table, monkeypatch):
+def test_retell_page_all_malformed_logged_when_ok_verdict_has_zero_stored(
+    fake_table, monkeypatch
+):
     # §7 / `_classify` boundary "1000 malformed -> ok + retell_page_all_malformed",
     # reached through the real orchestrator (not `process_and_store_logs`
     # directly) — every other seeded `StoreOutcome` in this file has
@@ -468,31 +1556,57 @@ def test_retell_page_all_malformed_logged_when_ok_verdict_has_zero_stored(fake_t
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(5), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 5, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(5), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 5, 0)
+    )
 
     with capture_logs() as cap:
         outcome = op._poll_retell_provider(provider)
 
     assert outcome == op.StoreOutcome(0, 5, 0)
     # pins impl L407-408's `logger.warning("retell_page_all_malformed", ...)`
-    assert {"event": "retell_page_all_malformed", "log_level": "warning", "provider_id": str(pid), "malformed": 5} in cap
-    assert "window" not in fake_table[pid].poll_state["retell"]  # ok verdict: the window still completes normally
+    assert {
+        "event": "retell_page_all_malformed",
+        "log_level": "warning",
+        "provider_id": str(pid),
+        "malformed": 5,
+    } in cap
+    assert (
+        "window" not in fake_table[pid].poll_state["retell"]
+    )  # ok verdict: the window still completes normally
 
 
-def test_windowed_multi_page_persists_key_no_advance_then_advances_on_last_page(fake_table, monkeypatch):
+def test_windowed_multi_page_persists_key_no_advance_then_advances_on_last_page(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
-    _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1, "p1"), has_more=True, next_key="cursor-1"))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    # F2: identical content on every call — see _freeze_now_then_over_budget.
+    _freeze_now_then_over_budget(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "p1"), has_more=True, next_key="cursor-1"),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     provider = _retell_provider(row)
     outcome = op._poll_retell_provider(provider)
@@ -502,7 +1616,12 @@ def test_windowed_multi_page_persists_key_no_advance_then_advances_on_last_page(
     assert window["pages_stored"] == 1
     assert fake_table[pid].last_fetched_at == wm  # unchanged mid-window
 
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1, "p2"), has_more=False))
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "p2"), has_more=False),
+    )
     provider = _retell_provider(row)
     outcome = op._poll_retell_provider(provider)
     assert outcome == op.StoreOutcome(1, 0, 0)
@@ -516,23 +1635,36 @@ def test_next_window_starts_where_the_completed_one_ended(fake_table, monkeypatc
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     provider = _retell_provider(row)
     op._poll_retell_provider(provider)
-    first_window_end = fake_table[pid].last_fetched_at  # the watermark IS the completed window's end
+    first_window_end = fake_table[
+        pid
+    ].last_fetched_at  # the watermark IS the completed window's end
     assert "window" not in fake_table[pid].poll_state["retell"]
 
     later = now + timedelta(minutes=5)
     _freeze_now(monkeypatch, later)
     seen_starts = []
     monkeypatch.setattr(
-        op.ObservabilityService, "fetch_retell_page",
-        lambda prov, start, end, **k: seen_starts.append(start) or _page(_calls(1), has_more=False),
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda prov, start, end, **k: (
+            seen_starts.append(start) or _page(_calls(1), has_more=False)
+        ),
     )
     provider = _retell_provider(fake_table[pid])
     op._poll_retell_provider(provider)
@@ -549,11 +1681,17 @@ def test_windowed_start_caught_up_to_end_is_a_no_op(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now  # the watermark is already at "now": start >= end after the lag is subtracted
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: pytest.fail("must not fetch: start >= end"))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: pytest.fail("must not fetch: start >= end"),
+    )
 
     outcome = op._poll_retell_provider(provider)
 
@@ -562,22 +1700,47 @@ def test_windowed_start_caught_up_to_end_is_a_no_op(fake_table, monkeypatch):
     assert fake_table[pid].last_fetched_at == wm  # untouched
 
 
-def test_digest_history_caps_at_eight_evicts_oldest_newest_last(fake_table, monkeypatch):
+def test_digest_history_caps_at_eight_evicts_oldest_newest_last(
+    fake_table, monkeypatch
+):
     # §7: "a page digest seen within the last 8 pages -> restart" implies the
     # history is actually bounded and ordered; every other test only ever
     # seeds 0 or 1 digest, so eviction and ordering were never exercised.
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(hours=1)
-    old_digests = [f"digest_{i}" for i in range(op.RETELL_DIGEST_HISTORY)]  # already at the cap
-    window = {"start": wm.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": False,
-              "key": "k8", "skip": None, "pages_stored": op.RETELL_DIGEST_HISTORY, "digests": list(old_digests), "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    old_digests = [
+        f"digest_{i}" for i in range(op.RETELL_DIGEST_HISTORY)
+    ]  # already at the cap
+    window = {
+        "start": wm.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "k8",
+        "skip": None,
+        "pages_stored": op.RETELL_DIGEST_HISTORY,
+        "total_pages": op.RETELL_DIGEST_HISTORY,
+        "digests": list(old_digests),
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
-    _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1, "fresh"), has_more=True, next_key="k9"))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    # F2: identical content on every call — see _freeze_now_then_over_budget.
+    _freeze_now_then_over_budget(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "fresh"), has_more=True, next_key="k9"),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
 
@@ -593,9 +1756,23 @@ def test_cursor_rejected_restarts_window_with_cause(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    window = {"start": wm.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": False,
-              "key": "stale", "skip": None, "pages_stored": 1, "digests": ["deadbeef"], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": wm.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "stale",
+        "skip": None,
+        "pages_stored": 1,
+        "total_pages": 1,
+        "digests": ["deadbeef"],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
@@ -620,21 +1797,45 @@ def test_cursor_rejected_restarts_window_with_cause(fake_table, monkeypatch):
     # on the steady-state path, not just an edge case.
     assert new_window["narrowed"] is False
     # the test's own name promises the cause reaches the event, not just the state
-    assert {"event": "retell_window_restarted", "log_level": "warning", "provider_id": str(pid),
-            "cause": "missing_key", "restarts": 1, "pages_stored": 1} in cap
+    assert {
+        "event": "retell_window_restarted",
+        "log_level": "warning",
+        "provider_id": str(pid),
+        "cause": "missing_key",
+        "restarts": 1,
+        "pages_stored": 1,
+    } in cap
 
 
 def test_repeated_digest_restarts_window(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    window = {"start": wm.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": False,
-              "key": "k1", "skip": None, "pages_stored": 1, "digests": [op._page_digest(_calls(1, "dup"))], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": wm.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "k1",
+        "skip": None,
+        "pages_stored": 1,
+        "total_pages": 1,
+        "digests": [op._page_digest(_calls(1, "dup"))],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1, "dup"), has_more=True, next_key="k2"))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "dup"), has_more=True, next_key="k2"),
+    )
 
     result = op._poll_retell_provider(provider)
     assert result is None
@@ -645,13 +1846,31 @@ def test_empty_page_with_has_more_after_first_page_restarts(fake_table, monkeypa
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    window = {"start": wm.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": False,
-              "key": "k1", "skip": None, "pages_stored": 1, "digests": ["deadbeef"], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": wm.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "k1",
+        "skip": None,
+        "pages_stored": 1,
+        "total_pages": 1,
+        "digests": ["deadbeef"],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page([], has_more=True, next_key="k2"))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page([], has_more=True, next_key="k2"),
+    )
 
     result = op._poll_retell_provider(provider)
     assert result is None
@@ -662,34 +1881,76 @@ def test_page_cap_restarts_window(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=30)
-    window = {"start": wm.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": False,
-              "key": "k1", "skip": None, "pages_stored": op.RETELL_MAX_PAGES_PER_WINDOW - 1, "digests": [], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": wm.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "k1",
+        "skip": None,
+        "pages_stored": op.RETELL_MAX_PAGES_PER_WINDOW - 1,
+        "total_pages": op.RETELL_MAX_PAGES_PER_WINDOW - 1,
+        "digests": [],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1, "capped"), has_more=True, next_key="k2"))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "capped"), has_more=True, next_key="k2"),
+    )
 
     with capture_logs() as cap:
         result = op._poll_retell_provider(provider)
     assert result is None
     assert fake_table[pid].poll_state["retell"]["window"]["restarts"] == 1
     # a mutation that passes a constant cause into every restart must not survive this
-    assert {"event": "retell_window_restarted", "log_level": "warning", "provider_id": str(pid),
-            "cause": "page_cap", "restarts": 1, "pages_stored": op.RETELL_MAX_PAGES_PER_WINDOW - 1} in cap
+    assert {
+        "event": "retell_window_restarted",
+        "log_level": "warning",
+        "provider_id": str(pid),
+        "cause": "page_cap",
+        "restarts": 1,
+        "pages_stored": op.RETELL_MAX_PAGES_PER_WINDOW - 1,
+    } in cap
 
 
 def test_three_restarts_halve_window_and_set_hint(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     start = now - timedelta(hours=2)
-    window = {"start": start.isoformat(), "end": now.isoformat(), "opened_at_hint": True, "narrowed": False,
-              "key": "k1", "skip": None, "pages_stored": 1, "digests": ["deadbeef"], "restarts": 2}
-    row = _FakeRow(id=pid, last_fetched_at=start, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": start.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": True,
+        "narrowed": False,
+        "key": "k1",
+        "skip": None,
+        "pages_stored": 1,
+        "total_pages": 1,
+        "digests": ["deadbeef"],
+        "restarts": 2,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=start,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page([], has_more=True, next_key="k2"))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page([], has_more=True, next_key="k2"),
+    )
 
     result = op._poll_retell_provider(provider)
     assert result is None
@@ -697,14 +1958,20 @@ def test_three_restarts_halve_window_and_set_hint(fake_table, monkeypatch):
     assert new_window["restarts"] == 0
     assert new_window["narrowed"] is True
     expected_width = (now - start) / 2
-    assert fake_table[pid].poll_state["retell"]["window_hint_seconds"] == int(expected_width.total_seconds())
+    assert fake_table[pid].poll_state["retell"]["window_hint_seconds"] == int(
+        expected_width.total_seconds()
+    )
 
 
 def test_hint_caps_new_window_width(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(hours=10)  # much wider than any hint
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True, "window_hint_seconds": 3600}})
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={"retell": {"bootstrapped": True, "window_hint_seconds": 3600}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
@@ -715,24 +1982,36 @@ def test_hint_caps_new_window_width(fake_table, monkeypatch):
         return _page(_calls(1), has_more=False)
 
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
-    (start_seen, end_seen), = seen
+    ((start_seen, end_seen),) = seen
     assert start_seen == wm
     assert (end_seen - start_seen) == timedelta(seconds=3600)
 
 
-def test_window_narrower_than_hint_does_not_count_toward_streak(fake_table, monkeypatch):
+def test_window_narrower_than_hint_does_not_count_toward_streak(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=5)  # natural width well under the 6h hint
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
     assert "one_page_streak" not in fake_table[pid].poll_state["retell"]
@@ -742,14 +2021,40 @@ def test_narrowed_window_one_page_result_does_not_grow_hint(fake_table, monkeypa
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     start = now - timedelta(minutes=10)
-    window = {"start": start.isoformat(), "end": now.isoformat(), "opened_at_hint": True, "narrowed": True,
-              "key": None, "skip": None, "pages_stored": 0, "digests": [], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=start, poll_state={"retell": {"bootstrapped": True, "window": window, "window_hint_seconds": 600}})
+    window = {
+        "start": start.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": True,
+        "narrowed": True,
+        "key": None,
+        "skip": None,
+        "pages_stored": 0,
+        "total_pages": 0,
+        "digests": [],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=start,
+        poll_state={
+            "retell": {
+                "bootstrapped": True,
+                "window": window,
+                "window_hint_seconds": 600,
+            }
+        },
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
     retell_state = fake_table[pid].poll_state["retell"]
@@ -761,17 +2066,30 @@ def test_three_one_page_windows_at_hint_double_it(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     hint_seconds = 3600
-    row = _FakeRow(id=pid, poll_state={"retell": {"bootstrapped": True, "window_hint_seconds": hint_seconds}})
+    row = _FakeRow(
+        id=pid,
+        poll_state={
+            "retell": {"bootstrapped": True, "window_hint_seconds": hint_seconds}
+        },
+    )
     fake_table[pid] = row
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     for i in range(1, op.RETELL_WINDOW_GROW_AFTER + 1):
         current_now = now + (i - 1) * timedelta(seconds=hint_seconds)
         _freeze_now(monkeypatch, current_now)
         # Set the watermark so the frozen window is exactly hint-width after
         # the visibility lag is subtracted (opened_at_hint requires >= hint).
-        fake_table[pid].last_fetched_at = current_now - timedelta(seconds=hint_seconds) - op.RETELL_VISIBILITY_LAG
+        fake_table[pid].last_fetched_at = (
+            current_now - timedelta(seconds=hint_seconds) - op.RETELL_VISIBILITY_LAG
+        )
         provider = _retell_provider(fake_table[pid])
         op._poll_retell_provider(provider)
 
@@ -789,14 +2107,24 @@ def test_one_page_streak_counts_regardless_of_page_size(fake_table, monkeypatch)
     hint_seconds = 3600
     row = _FakeRow(
         id=pid,
-        last_fetched_at=now - timedelta(seconds=hint_seconds) - op.RETELL_VISIBILITY_LAG,
-        poll_state={"retell": {"bootstrapped": True, "window_hint_seconds": hint_seconds}},
+        last_fetched_at=now
+        - timedelta(seconds=hint_seconds)
+        - op.RETELL_VISIBILITY_LAG,
+        poll_state={
+            "retell": {"bootstrapped": True, "window_hint_seconds": hint_seconds}
+        },
     )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(750), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(750, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(750), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(750, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
 
@@ -810,34 +2138,77 @@ def test_hint_doubling_is_capped_at_max(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     hint_seconds = int(op.RETELL_WINDOW_HINT_MAX.total_seconds()) - 100
-    row = _FakeRow(id=pid, poll_state={"retell": {"bootstrapped": True, "window_hint_seconds": hint_seconds}})
+    row = _FakeRow(
+        id=pid,
+        poll_state={
+            "retell": {"bootstrapped": True, "window_hint_seconds": hint_seconds}
+        },
+    )
     fake_table[pid] = row
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     for i in range(1, op.RETELL_WINDOW_GROW_AFTER + 1):
         current_now = now + (i - 1) * timedelta(seconds=hint_seconds)
         _freeze_now(monkeypatch, current_now)
-        fake_table[pid].last_fetched_at = current_now - timedelta(seconds=hint_seconds) - op.RETELL_VISIBILITY_LAG
+        fake_table[pid].last_fetched_at = (
+            current_now - timedelta(seconds=hint_seconds) - op.RETELL_VISIBILITY_LAG
+        )
         provider = _retell_provider(fake_table[pid])
         op._poll_retell_provider(provider)
 
     retell_state = fake_table[pid].poll_state["retell"]
-    assert retell_state["window_hint_seconds"] == int(op.RETELL_WINDOW_HINT_MAX.total_seconds())
+    assert retell_state["window_hint_seconds"] == int(
+        op.RETELL_WINDOW_HINT_MAX.total_seconds()
+    )
 
 
-def test_multi_page_window_completed_by_cursor_drops_hint_entirely(fake_table, monkeypatch):
+def test_multi_page_window_completed_by_cursor_drops_hint_entirely(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     start = now - timedelta(hours=1)
-    window = {"start": start.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": False,
-              "key": "k1", "skip": None, "pages_stored": 1, "digests": ["deadbeef"], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=start, poll_state={"retell": {"bootstrapped": True, "window": window, "window_hint_seconds": 900}})
+    window = {
+        "start": start.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": "k1",
+        "skip": None,
+        "pages_stored": 1,
+        "total_pages": 1,
+        "digests": ["deadbeef"],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=start,
+        poll_state={
+            "retell": {
+                "bootstrapped": True,
+                "window": window,
+                "window_hint_seconds": 900,
+            }
+        },
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1, "final"), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1, "final"), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
     retell_state = fake_table[pid].poll_state["retell"]
@@ -845,19 +2216,41 @@ def test_multi_page_window_completed_by_cursor_drops_hint_entirely(fake_table, m
     assert "one_page_streak" not in retell_state
 
 
-def test_poll_behind_fires_on_completed_window_older_than_warn_threshold(fake_table, monkeypatch):
+def test_poll_behind_fires_on_completed_window_older_than_warn_threshold(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     start = now - op.RETELL_BEHIND_WARN - timedelta(minutes=30) - timedelta(minutes=1)
     end = now - op.RETELL_BEHIND_WARN - timedelta(minutes=30)
-    window = {"start": start.isoformat(), "end": end.isoformat(), "opened_at_hint": False, "narrowed": False,
-              "key": None, "skip": None, "pages_stored": 0, "digests": [], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=start, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": None,
+        "skip": None,
+        "pages_stored": 0,
+        "total_pages": 0,
+        "digests": [],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=start,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
     logged = []
     monkeypatch.setattr(op, "_log_behind", lambda *a, **k: logged.append(a))
 
@@ -901,12 +2294,24 @@ def test_malformed_window_in_state_treated_as_absent(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=10)
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True, "window": {"start": "not-a-window"}}})
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=wm,
+        poll_state={
+            "retell": {"bootstrapped": True, "window": {"start": "not-a-window"}}
+        },
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     result = op._poll_retell_provider(provider)  # must not raise
     assert result is not None
@@ -916,51 +2321,86 @@ def test_poisoned_watermark_uses_lookback_and_is_repaired(fake_table, monkeypatc
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     future_wm = now + timedelta(hours=2)
-    row = _FakeRow(id=pid, last_fetched_at=future_wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=future_wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
-    assert fake_table[pid].last_fetched_at != future_wm  # repaired away from the poisoned value
+    assert (
+        fake_table[pid].last_fetched_at != future_wm
+    )  # repaired away from the poisoned value
 
 
 def test_missing_watermark_after_bootstrap_uses_lookback(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
-    row = _FakeRow(id=pid, last_fetched_at=None, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=None, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
     seen = []
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda prov, start, end, **k: seen.append((start, end)) or _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda prov, start, end, **k: (
+            seen.append((start, end)) or _page(_calls(1), has_more=False)
+        ),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
-    (start, _end), = seen
-    assert start == (now - op.RETELL_VISIBILITY_LAG - op.RETELL_FUTURE_WATERMARK_LOOKBACK)
+    ((start, _end),) = seen
+    assert start == (
+        now - op.RETELL_VISIBILITY_LAG - op.RETELL_FUTURE_WATERMARK_LOOKBACK
+    )
 
 
-def test_provider_poll_state_write_skipped_when_zero_rows_updated_via_poll(fake_table, monkeypatch):
+def test_provider_poll_state_write_skipped_when_zero_rows_updated_via_poll(
+    fake_table, monkeypatch
+):
     # Unlike the direct-helper test above, this exercises the event through a
     # real call site: the provider row vanishes from the table between the
     # in-memory bootstrap and `_poll_retell_provider`'s final state write, so
     # the update matches 0 rows and the run must end with no marker set.
     pid = uuid.uuid4()  # deliberately never inserted into fake_table
     provider = SimpleNamespace(
-        id=pid, provider=ProviderChoices.RETELL, poll_state={},
-        last_fetched_at=None, project=SimpleNamespace(id="project-1", organization_id="org-1"),
+        id=pid,
+        provider=ProviderChoices.RETELL,
+        poll_state={},
+        last_fetched_at=None,
+        project=SimpleNamespace(id="project-1", organization_id="org-1"),
     )
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1)))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1))
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     with capture_logs() as cap:
         result = op._poll_retell_provider(provider)
 
     assert result is None
-    assert {"event": "provider_poll_state_write_skipped", "log_level": "error", "provider_id": str(pid)} in cap
+    assert {
+        "event": "provider_poll_state_write_skipped",
+        "log_level": "error",
+        "provider_id": str(pid),
+    } in cap
     assert pid not in fake_table
 
 
@@ -972,10 +2412,24 @@ def test_provider_poll_state_write_skipped_when_zero_rows_updated_via_poll(fake_
 def test_window_at_min_width_falls_back_to_offset_mode(fake_table):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
-    start = now - timedelta(seconds=1)  # already at RETELL_MIN_WINDOW: halving is no longer an option
-    window = {"start": start.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": True,
-              "key": "k1", "skip": None, "pages_stored": 0, "digests": [], "restarts": 2}  # about to hit the restart cap
-    row = _FakeRow(id=pid, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    start = now - timedelta(
+        seconds=1
+    )  # already at RETELL_MIN_WINDOW: halving is no longer an option
+    window = {
+        "start": start.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": True,
+        "key": "k1",
+        "skip": None,
+        "pages_stored": 0,
+        "total_pages": 0,
+        "digests": [],
+        "restarts": 2,
+    }  # about to hit the restart cap
+    row = _FakeRow(
+        id=pid, poll_state={"retell": {"bootstrapped": True, "window": window}}
+    )
     fake_table[pid] = row
     state = op._read_retell_state(_retell_provider(row))
     state["window"] = window
@@ -984,19 +2438,36 @@ def test_window_at_min_width_falls_back_to_offset_mode(fake_table):
 
     new_window = fake_table[pid].poll_state["retell"]["window"]
     assert new_window["restarts"] == 0  # reset on entering offset mode
-    assert new_window["skip"] == 0  # offset mode entered: halving was not possible at the 1s floor
+    assert (
+        new_window["skip"] == 0
+    )  # offset mode entered: halving was not possible at the 1s floor
 
 
 def test_offset_mode_skip_increments_by_page_limit(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     start = now - timedelta(seconds=1)
-    window = {"start": start.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": True,
-              "key": None, "skip": 0, "pages_stored": 0, "digests": [], "restarts": 0}
-    row = _FakeRow(id=pid, last_fetched_at=start, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": start.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": True,
+        "key": None,
+        "skip": 0,
+        "pages_stored": 0,
+        "total_pages": 0,
+        "digests": [],
+        "restarts": 0,
+    }
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=start,
+        poll_state={"retell": {"bootstrapped": True, "window": window}},
+    )
     fake_table[pid] = row
     provider = _retell_provider(row)
-    _freeze_now(monkeypatch, now)
+    # F2: identical content on every call — see _freeze_now_then_over_budget.
+    _freeze_now_then_over_budget(monkeypatch, now)
     seen_skip = []
 
     def fake_fetch(prov, s, e, *, pagination_key=None, skip=None):
@@ -1004,11 +2475,16 @@ def test_offset_mode_skip_increments_by_page_limit(fake_table, monkeypatch):
         return _page(_calls(1000), has_more=True)
 
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1000, 0, 0))
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1000, 0, 0)
+    )
 
     op._poll_retell_provider(provider)
     assert seen_skip == [0]
-    assert fake_table[pid].poll_state["retell"]["window"]["skip"] == op.RETELL_LIST_PAGE_LIMIT
+    assert (
+        fake_table[pid].poll_state["retell"]["window"]["skip"]
+        == op.RETELL_LIST_PAGE_LIMIT
+    )
 
 
 def test_offset_failure_stalls_loudly(fake_table, monkeypatch):
@@ -1017,9 +2493,21 @@ def test_offset_failure_stalls_loudly(fake_table, monkeypatch):
     start = now - timedelta(seconds=1)
     # Already in offset mode (skip=0) and about to hit the restart cap again:
     # per D15, this is the last-resort path with nowhere further to fall back.
-    window = {"start": start.isoformat(), "end": now.isoformat(), "opened_at_hint": False, "narrowed": True,
-              "key": None, "skip": 0, "pages_stored": 0, "digests": [], "restarts": 2}
-    row = _FakeRow(id=pid, poll_state={"retell": {"bootstrapped": True, "window": window}})
+    window = {
+        "start": start.isoformat(),
+        "end": now.isoformat(),
+        "opened_at_hint": False,
+        "narrowed": True,
+        "key": None,
+        "skip": 0,
+        "pages_stored": 0,
+        "total_pages": 0,
+        "digests": [],
+        "restarts": 2,
+    }
+    row = _FakeRow(
+        id=pid, poll_state={"retell": {"bootstrapped": True, "window": window}}
+    )
     fake_table[pid] = row
     state = op._read_retell_state(_retell_provider(row))
     state["window"] = window
@@ -1029,7 +2517,9 @@ def test_offset_failure_stalls_loudly(fake_table, monkeypatch):
     new_window = fake_table[pid].poll_state["retell"]["window"]
     assert new_window["skip"] == 0
     assert new_window["restarts"] == 0  # reset, but the run never advances
-    assert "retell_window_stuck" in [e["event"] for e in cap if e["log_level"] == "error"]
+    assert "retell_window_stuck" in [
+        e["event"] for e in cap if e["log_level"] == "error"
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -1041,11 +2531,19 @@ def test_windowed_partial_failure_twice_then_abandoned_third(fake_table, monkeyp
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=10)
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(2), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 1))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(2), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 1)
+    )
 
     for i in range(1, 3):
         provider = _retell_provider(fake_table[pid])
@@ -1061,19 +2559,34 @@ def test_windowed_partial_failure_twice_then_abandoned_third(fake_table, monkeyp
     assert "failed_runs" not in fake_table[pid].poll_state["retell"]
     assert "window" not in fake_table[pid].poll_state["retell"]  # completed and popped
     # pins impl L400-405's windowed `logger.error("retell_page_abandoned", ...)`
-    assert {"event": "retell_page_abandoned", "log_level": "error", "provider_id": str(pid),
-            "abandoned": 1, "failed_runs": 3} in cap
+    assert {
+        "event": "retell_page_abandoned",
+        "log_level": "error",
+        "provider_id": str(pid),
+        "abandoned": 1,
+        "failed_runs": 3,
+    } in cap
 
 
-def test_windowed_total_failure_backs_off_doubles_and_caps_then_clears_on_success(fake_table, monkeypatch):
+def test_windowed_total_failure_backs_off_doubles_and_caps_then_clears_on_success(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(minutes=10)
-    row = _FakeRow(id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}})
+    row = _FakeRow(
+        id=pid, last_fetched_at=wm, poll_state={"retell": {"bootstrapped": True}}
+    )
     fake_table[pid] = row
     _freeze_now(monkeypatch, now)
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1), has_more=False))
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 1))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(1), has_more=False),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 1)
+    )
 
     provider = _retell_provider(fake_table[pid])
     op._poll_retell_provider(provider)
@@ -1087,7 +2600,9 @@ def test_windowed_total_failure_backs_off_doubles_and_caps_then_clears_on_succes
     assert fake_table[pid].poll_state["retell"]["total_failures"] == 2
 
     # now succeed: total_failures / backoff_until must clear
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
     second_backoff = op._parse(fake_table[pid].poll_state["retell"]["backoff_until"])
     _freeze_now(monkeypatch, second_backoff + timedelta(seconds=1))
     provider = _retell_provider(fake_table[pid])
@@ -1117,9 +2632,13 @@ def test_manual_run_pages_up_to_cap_and_never_writes(fake_table, monkeypatch):
         return _page(_calls(1), has_more=True, next_key=f"k{len(calls_made)}")
 
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
-    outcome = op._manual_retell_run(provider, start_time=_dt(2026, 1, 1), end_time=_dt(2026, 1, 2))
+    outcome = op._manual_retell_run(
+        provider, start_time=_dt(2026, 1, 1), end_time=_dt(2026, 1, 2)
+    )
     assert len(calls_made) == op.RETELL_MANUAL_RUN_MAX_PAGES
     assert outcome == op.StoreOutcome(1, 0, 0)
     assert fake_table[pid].poll_state == {}  # never written
@@ -1146,7 +2665,9 @@ def test_manual_run_rejects_empty_range():
 
 def test_fetch_observability_logs_manual_requires_provider_id():
     with capture_logs() as cap:
-        op.fetch_observability_logs._original_func(start_time="2026-01-01T00:00:00+00:00")
+        op.fetch_observability_logs._original_func(
+            start_time="2026-01-01T00:00:00+00:00"
+        )
     assert cap and cap[0]["event"] == "provider_manual_run_rejected"
     assert cap[0]["log_level"] == "error"
     assert cap[0]["reason"] == "provider_id_required"
@@ -1158,7 +2679,9 @@ def test_fetch_observability_logs_manual_requires_provider_id():
 # --------------------------------------------------------------------------
 
 
-def test_scheduled_no_args_fans_out_over_enabled_providers_only(fake_table, monkeypatch):
+def test_scheduled_no_args_fans_out_over_enabled_providers_only(
+    fake_table, monkeypatch
+):
     # Two enabled, one disabled: proves `.filter(enabled=True)` is honoured,
     # not just that *some* provider gets dispatched.
     enabled_1, enabled_2, disabled = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
@@ -1168,7 +2691,7 @@ def test_scheduled_no_args_fans_out_over_enabled_providers_only(fake_table, monk
 
     dispatched = []
 
-    def fake_dispatch(provider_id, *, scheduled, start_time, end_time):
+    def fake_dispatch(provider_id, *, scheduled, start_time, end_time, deadline=None):
         dispatched.append((provider_id, scheduled, start_time, end_time))
         return op.StoreOutcome(0, 0, 0)
 
@@ -1183,6 +2706,79 @@ def test_scheduled_no_args_fans_out_over_enabled_providers_only(fake_table, monk
         assert end_time is None
 
 
+def test_fan_out_shuffles_dispatch_order_for_fairness(fake_table, monkeypatch):
+    # F1(d)/N1: `random.shuffle` over the materialised provider-id list means
+    # a starved tail rotates between firings instead of the same providers
+    # always dispatching last (a plain `.iterator()` over an unordered
+    # queryset can otherwise be stable enough to starve the same tail every
+    # time). Patch shuffle to a deterministic reverse and assert dispatch
+    # follows the shuffled order, not table-insertion order.
+    p1, p2, p3 = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    fake_table[p1] = _FakeRow(id=p1, enabled=True)
+    fake_table[p2] = _FakeRow(id=p2, enabled=True)
+    fake_table[p3] = _FakeRow(id=p3, enabled=True)
+
+    dispatched = []
+
+    def fake_dispatch(provider_id, *, scheduled, start_time, end_time, deadline=None):
+        dispatched.append(provider_id)
+        return op.StoreOutcome(0, 0, 0)
+
+    monkeypatch.setattr(op, "fetch_logs_for_provider", fake_dispatch)
+    monkeypatch.setattr(op.random, "shuffle", lambda lst: lst.reverse())
+
+    op.fetch_observability_logs._original_func()
+
+    assert dispatched == [p3, p2, p1]  # reverse of insertion order, proving shuffle ran
+
+
+def test_fan_out_skips_remaining_providers_after_deadline_and_logs_once(
+    fake_table, monkeypatch
+):
+    # F1(c)/N1: once the activity-level deadline has passed, providers not
+    # yet dispatched are skipped instead of each burning a fresh run budget
+    # against an already-blown 3h activity time_limit, and the skip is
+    # logged ONCE with a count field — not once per skipped provider.
+    p1, p2, p3 = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    fake_table[p1] = _FakeRow(id=p1, enabled=True)
+    fake_table[p2] = _FakeRow(id=p2, enabled=True)
+    fake_table[p3] = _FakeRow(id=p3, enabled=True)
+    monkeypatch.setattr(
+        op.random, "shuffle", lambda lst: None
+    )  # keep insertion order so the assertion below is readable
+
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    clock = {"t": now}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    dispatched = []
+    deadlines = []
+
+    def fake_dispatch(provider_id, *, scheduled, start_time, end_time, deadline=None):
+        dispatched.append(provider_id)
+        deadlines.append(deadline)
+        # Simulate the first provider's run alone consuming the whole
+        # activity budget — exactly the scenario F1 protects against.
+        clock["t"] = clock["t"] + op.RETELL_ACTIVITY_BUDGET + timedelta(minutes=1)
+        return op.StoreOutcome(0, 0, 0)
+
+    monkeypatch.setattr(op, "fetch_logs_for_provider", fake_dispatch)
+
+    with capture_logs() as cap:
+        op.fetch_observability_logs._original_func()
+
+    assert dispatched == [p1]  # only the first provider ran before the deadline passed
+    # R3 M1: the deadline actually travels down the wire — dropping the
+    # `deadline=deadline` kwarg in the fan-out would silently revert to
+    # per-provider budgets with every other assertion here still green.
+    assert deadlines == [now + op.RETELL_ACTIVITY_BUDGET]
+    budget_events = [e for e in cap if e["event"] == "retell_activity_budget_exhausted"]
+    assert len(budget_events) == 1  # once, not once per skipped provider
+    assert budget_events[0]["log_level"] == "warning"
+    assert budget_events[0]["skipped_providers"] == 2
+    assert set(budget_events[0]) == {"event", "log_level", "skipped_providers"}
+
+
 def test_scheduled_with_only_provider_id_dispatches_exactly_that_provider(monkeypatch):
     # `provider_id` given + no bounds is still scheduled-shaped (R11-3): it
     # must resolve to a single-element dispatch list, never the enabled=True
@@ -1191,10 +2787,12 @@ def test_scheduled_with_only_provider_id_dispatches_exactly_that_provider(monkey
     target = "provider-123"
     dispatched = []
     monkeypatch.setattr(
-        op, "fetch_logs_for_provider",
-        lambda provider_id, *, scheduled, start_time, end_time: dispatched.append(
-            (provider_id, scheduled, start_time, end_time)
-        ) or op.StoreOutcome(0, 0, 0),
+        op,
+        "fetch_logs_for_provider",
+        lambda provider_id, *, scheduled, start_time, end_time, deadline=None: (
+            dispatched.append((provider_id, scheduled, start_time, end_time))
+            or op.StoreOutcome(0, 0, 0)
+        ),
     )
 
     op.fetch_observability_logs._original_func(provider_id=target)
@@ -1209,7 +2807,7 @@ def test_scheduled_computes_scheduled_before_any_end_time_defaulting(monkeypatch
     # observe a concrete `end_time` instead of `None` and/or `scheduled=False`.
     seen = {}
 
-    def fake_dispatch(provider_id, *, scheduled, start_time, end_time):
+    def fake_dispatch(provider_id, *, scheduled, start_time, end_time, deadline=None):
         seen["scheduled"] = scheduled
         seen["start_time"] = start_time
         seen["end_time"] = end_time
@@ -1217,7 +2815,9 @@ def test_scheduled_computes_scheduled_before_any_end_time_defaulting(monkeypatch
 
     monkeypatch.setattr(op, "fetch_logs_for_provider", fake_dispatch)
 
-    op.fetch_observability_logs._original_func(provider_id="p1")  # no bounds: must stay scheduled-shaped
+    op.fetch_observability_logs._original_func(
+        provider_id="p1"
+    )  # no bounds: must stay scheduled-shaped
 
     assert seen["scheduled"] is True
     assert seen["start_time"] is None
@@ -1241,22 +2841,33 @@ def test_http_401_logs_retell_auth_failed(fake_table, monkeypatch):
     row = _FakeRow(id=pid, poll_state={}, provider=ProviderChoices.RETELL)
     fake_table[pid] = row
 
-    def boom(provider):
+    def boom(provider, **kwargs):
         raise _http_error(401)
 
     monkeypatch.setattr(op, "_poll_retell_provider", boom)
 
     with capture_logs() as cap:
-        result = op.fetch_logs_for_provider(pid, scheduled=True, start_time=None, end_time=None)
+        result = op.fetch_logs_for_provider(
+            pid, scheduled=True, start_time=None, end_time=None
+        )
 
     assert result is None
     # pins impl's first `if provider.provider == ProviderChoices.RETELL and
     # status in (401, 403): logger.error("retell_auth_failed", ...)` branch —
     # exact field set, and no `authentication_failed_for_provider` sneaking in.
-    assert cap == [{"event": "retell_auth_failed", "log_level": "error", "provider_id": str(pid), "status_code": 401}]
+    assert cap == [
+        {
+            "event": "retell_auth_failed",
+            "log_level": "error",
+            "provider_id": str(pid),
+            "status_code": 401,
+        }
+    ]
 
 
-def test_non_retell_401_logs_authentication_failed_for_provider_not_retell_auth_failed(fake_table, monkeypatch):
+def test_non_retell_401_logs_authentication_failed_for_provider_not_retell_auth_failed(
+    fake_table, monkeypatch
+):
     # The four other providers must keep their own auth event; a Retell label here would misroute alerts.
     # Pins impl's `elif provider.provider != ProviderChoices.RETELL and
     # status in (401, 403): logger.error("authentication_failed_for_provider", ...)`
@@ -1273,14 +2884,24 @@ def test_non_retell_401_logs_authentication_failed_for_provider_not_retell_auth_
     monkeypatch.setattr(op, "_poll_other_provider", boom)
 
     with capture_logs() as cap:
-        result = op.fetch_logs_for_provider(pid, scheduled=True, start_time=None, end_time=None)
+        result = op.fetch_logs_for_provider(
+            pid, scheduled=True, start_time=None, end_time=None
+        )
 
     assert result is None
-    assert cap == [{"event": "authentication_failed_for_provider", "log_level": "error",
-                     "provider_type": ProviderChoices.BLAND, "status_code": 401}]
+    assert cap == [
+        {
+            "event": "authentication_failed_for_provider",
+            "log_level": "error",
+            "provider_type": ProviderChoices.BLAND,
+            "status_code": 401,
+        }
+    ]
 
 
-def test_non_retell_403_logs_authentication_failed_for_provider(fake_table, monkeypatch):
+def test_non_retell_403_logs_authentication_failed_for_provider(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     row = _FakeRow(id=pid, poll_state={}, provider=ProviderChoices.VAPI)
     fake_table[pid] = row
@@ -1291,14 +2912,24 @@ def test_non_retell_403_logs_authentication_failed_for_provider(fake_table, monk
     monkeypatch.setattr(op, "_poll_other_provider", boom)
 
     with capture_logs() as cap:
-        result = op.fetch_logs_for_provider(pid, scheduled=True, start_time=None, end_time=None)
+        result = op.fetch_logs_for_provider(
+            pid, scheduled=True, start_time=None, end_time=None
+        )
 
     assert result is None
-    assert cap == [{"event": "authentication_failed_for_provider", "log_level": "error",
-                     "provider_type": ProviderChoices.VAPI, "status_code": 403}]
+    assert cap == [
+        {
+            "event": "authentication_failed_for_provider",
+            "log_level": "error",
+            "provider_type": ProviderChoices.VAPI,
+            "status_code": 403,
+        }
+    ]
 
 
-def test_non_retell_non_auth_http_error_logs_provider_log_fetch_failed(fake_table, monkeypatch):
+def test_non_retell_non_auth_http_error_logs_provider_log_fetch_failed(
+    fake_table, monkeypatch
+):
     # A non-401/403 status must fall through both auth branches into the
     # generic `provider_log_fetch_failed`, with `provider_type` (row loaded)
     # and `status_code` (an HTTPError) both present.
@@ -1312,11 +2943,21 @@ def test_non_retell_non_auth_http_error_logs_provider_log_fetch_failed(fake_tabl
     monkeypatch.setattr(op, "_poll_other_provider", boom)
 
     with capture_logs() as cap:
-        result = op.fetch_logs_for_provider(pid, scheduled=True, start_time=None, end_time=None)
+        result = op.fetch_logs_for_provider(
+            pid, scheduled=True, start_time=None, end_time=None
+        )
 
     assert result is None
-    assert cap == [{"event": "provider_log_fetch_failed", "log_level": "error", "provider_id": str(pid),
-                     "provider_type": ProviderChoices.TWILIO, "status_code": 500, "error_type": "HTTPError"}]
+    assert cap == [
+        {
+            "event": "provider_log_fetch_failed",
+            "log_level": "error",
+            "provider_id": str(pid),
+            "provider_type": ProviderChoices.TWILIO,
+            "status_code": 500,
+            "error_type": "HTTPError",
+        }
+    ]
 
 
 def test_http_error_without_response_logs_status_code_none(fake_table, monkeypatch):
@@ -1332,11 +2973,21 @@ def test_http_error_without_response_logs_status_code_none(fake_table, monkeypat
     monkeypatch.setattr(op, "_poll_other_provider", boom)
 
     with capture_logs() as cap:
-        result = op.fetch_logs_for_provider(pid, scheduled=True, start_time=None, end_time=None)
+        result = op.fetch_logs_for_provider(
+            pid, scheduled=True, start_time=None, end_time=None
+        )
 
     assert result is None
-    assert cap == [{"event": "provider_log_fetch_failed", "log_level": "error", "provider_id": str(pid),
-                     "provider_type": ProviderChoices.ELEVEN_LABS, "status_code": None, "error_type": "HTTPError"}]
+    assert cap == [
+        {
+            "event": "provider_log_fetch_failed",
+            "log_level": "error",
+            "provider_id": str(pid),
+            "provider_type": ProviderChoices.ELEVEN_LABS,
+            "status_code": None,
+            "error_type": "HTTPError",
+        }
+    ]
 
 
 def test_retell_configuration_error_logged(fake_table, monkeypatch):
@@ -1344,13 +2995,17 @@ def test_retell_configuration_error_logged(fake_table, monkeypatch):
     row = _FakeRow(id=pid, poll_state={})
     fake_table[pid] = row
 
-    def boom(provider):
-        raise RetellConfigurationError("Retell API key is not configured for this agent")
+    def boom(provider, **kwargs):
+        raise RetellConfigurationError(
+            "Retell API key is not configured for this agent"
+        )
 
     monkeypatch.setattr(op, "_poll_retell_provider", boom)
 
     with capture_logs() as cap:
-        result = op.fetch_logs_for_provider(pid, scheduled=True, start_time=None, end_time=None)
+        result = op.fetch_logs_for_provider(
+            pid, scheduled=True, start_time=None, end_time=None
+        )
     assert result is None
     assert cap[-1]["event"] == "retell_configuration_error"
     assert cap[-1]["log_level"] == "error"
@@ -1358,7 +3013,9 @@ def test_retell_configuration_error_logged(fake_table, monkeypatch):
     assert cap[-1]["error_type"] == "RetellConfigurationError"
 
 
-def test_manual_run_cursor_rejected_propagates_to_generic_handler(fake_table, monkeypatch):
+def test_manual_run_cursor_rejected_propagates_to_generic_handler(
+    fake_table, monkeypatch
+):
     # A manual run does not handle a rejected cursor itself; the generic handler must see it.
     pid = uuid.uuid4()
     row = _FakeRow(id=pid, poll_state={}, provider=ProviderChoices.RETELL)
@@ -1370,18 +3027,36 @@ def test_manual_run_cursor_rejected_propagates_to_generic_handler(fake_table, mo
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", raise_rejected)
 
     with capture_logs() as cap:
-        result = op.fetch_logs_for_provider(pid, scheduled=False, start_time=_dt(2026, 1, 1), end_time=None)
+        result = op.fetch_logs_for_provider(
+            pid, scheduled=False, start_time=_dt(2026, 1, 1), end_time=None
+        )
 
     assert result is None
-    assert cap == [{"event": "provider_log_fetch_failed", "log_level": "error",
-                     "provider_id": str(pid), "provider_type": ProviderChoices.RETELL,
-                     "error_type": "RetellCursorRejected"}]
+    assert cap == [
+        {
+            "event": "provider_log_fetch_failed",
+            "log_level": "error",
+            "provider_id": str(pid),
+            "provider_type": ProviderChoices.RETELL,
+            "error_type": "RetellCursorRejected",
+        }
+    ]
 
 
 def test_fetch_logs_for_provider_not_found_scheduled_vs_manual(fake_table):
     missing_id = uuid.uuid4()
-    assert op.fetch_logs_for_provider(missing_id, scheduled=True, start_time=None, end_time=None) is None
-    assert op.fetch_logs_for_provider(missing_id, scheduled=False, start_time=_dt(2026, 1, 1), end_time=None) is None
+    assert (
+        op.fetch_logs_for_provider(
+            missing_id, scheduled=True, start_time=None, end_time=None
+        )
+        is None
+    )
+    assert (
+        op.fetch_logs_for_provider(
+            missing_id, scheduled=False, start_time=_dt(2026, 1, 1), end_time=None
+        )
+        is None
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1392,12 +3067,14 @@ def test_fetch_logs_for_provider_not_found_scheduled_vs_manual(fake_table):
 def test_naive_iso_input_is_made_aware(fake_table, monkeypatch):
     seen = {}
 
-    def fake_dispatch(provider_id, *, scheduled, start_time, end_time):
+    def fake_dispatch(provider_id, *, scheduled, start_time, end_time, deadline=None):
         seen["start_time"] = start_time
         return op.StoreOutcome(0, 0, 0)
 
     monkeypatch.setattr(op, "fetch_logs_for_provider", fake_dispatch)
-    op.fetch_observability_logs._original_func(start_time="2026-01-01T00:00:00", provider_id="p1")
+    op.fetch_observability_logs._original_func(
+        start_time="2026-01-01T00:00:00", provider_id="p1"
+    )
     assert seen["start_time"].tzinfo is not None
 
 
@@ -1416,25 +3093,37 @@ def test_other_provider_advances_after_store_unconditionally(fake_table, monkeyp
     now = _dt(2026, 1, 1, 12, 0, 0)
     row = _FakeRow(id=pid, last_fetched_at=now - timedelta(hours=1))
     fake_table[pid] = row
-    provider = SimpleNamespace(id=pid, provider=ProviderChoices.VAPI, last_fetched_at=row.last_fetched_at)
+    provider = SimpleNamespace(
+        id=pid, provider=ProviderChoices.VAPI, last_fetched_at=row.last_fetched_at
+    )
     monkeypatch.setattr(op.timezone, "now", lambda: now)
-    monkeypatch.setattr(op.ObservabilityService, "get_call_logs", lambda **k: [{"id": "c1"}])
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService, "get_call_logs", lambda **k: [{"id": "c1"}]
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
+    )
 
     outcome = op._poll_other_provider(provider, start_time=None, end_time=None)
     assert outcome == op.StoreOutcome(1, 0, 0)
     assert fake_table[pid].last_fetched_at == now
 
 
-def test_other_provider_store_exception_does_not_advance_and_propagates(fake_table, monkeypatch):
+def test_other_provider_store_exception_does_not_advance_and_propagates(
+    fake_table, monkeypatch
+):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(hours=1)
     row = _FakeRow(id=pid, last_fetched_at=wm)
     fake_table[pid] = row
-    provider = SimpleNamespace(id=pid, provider=ProviderChoices.VAPI, last_fetched_at=wm)
+    provider = SimpleNamespace(
+        id=pid, provider=ProviderChoices.VAPI, last_fetched_at=wm
+    )
     monkeypatch.setattr(op.timezone, "now", lambda: now)
-    monkeypatch.setattr(op.ObservabilityService, "get_call_logs", lambda **k: [{"id": "c1"}])
+    monkeypatch.setattr(
+        op.ObservabilityService, "get_call_logs", lambda **k: [{"id": "c1"}]
+    )
 
     def boom(*a, **k):
         raise ValueError("normalize blew up")
@@ -1450,10 +3139,15 @@ def test_other_provider_store_exception_does_not_advance_and_propagates(fake_tab
     # the `pytest.raises` and watermark assertions unchanged, so only the
     # event itself proves the diagnostic still fires before propagation.
     counts_events = [e for e in cap if e["event"] == "provider_log_processing_failed"]
-    assert counts_events == [{
-        "event": "provider_log_processing_failed", "log_level": "error",
-        "provider_type": ProviderChoices.VAPI, "logs_count": 1, "error_type": "ValueError",
-    }]
+    assert counts_events == [
+        {
+            "event": "provider_log_processing_failed",
+            "log_level": "error",
+            "provider_type": ProviderChoices.VAPI,
+            "logs_count": 1,
+            "error_type": "ValueError",
+        }
+    ]
 
 
 def test_other_provider_future_watermark_repaired_and_clamped(fake_table, monkeypatch):
@@ -1462,13 +3156,23 @@ def test_other_provider_future_watermark_repaired_and_clamped(fake_table, monkey
     future_wm = now + timedelta(hours=2)
     row = _FakeRow(id=pid, last_fetched_at=future_wm)
     fake_table[pid] = row
-    provider = SimpleNamespace(id=pid, provider=ProviderChoices.BLAND, last_fetched_at=future_wm)
+    provider = SimpleNamespace(
+        id=pid, provider=ProviderChoices.BLAND, last_fetched_at=future_wm
+    )
     monkeypatch.setattr(op.timezone, "now", lambda: now)
     seen = {}
-    monkeypatch.setattr(op.ObservabilityService, "get_call_logs", lambda **k: seen.setdefault("kw", k) and [])
-    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 0))
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "get_call_logs",
+        lambda **k: seen.setdefault("kw", k) and [],
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 0)
+    )
 
-    outcome = op._poll_other_provider(provider, start_time=None, end_time=now + timedelta(hours=5))
+    outcome = op._poll_other_provider(
+        provider, start_time=None, end_time=now + timedelta(hours=5)
+    )
     assert outcome == op.StoreOutcome(0, 0, 0)
     assert seen["kw"]["end_time"] == now  # clamped to now, never beyond
     assert seen["kw"]["start_time"] == now - op.RETELL_FUTURE_WATERMARK_LOOKBACK
@@ -1480,14 +3184,20 @@ def test_other_provider_future_watermark_repaired_and_clamped(fake_table, monkey
 
 
 def test_process_and_store_logs_unknown_provider_returns_empty_outcome():
-    provider = SimpleNamespace(provider=ProviderChoices.LIVEKIT, project=SimpleNamespace(id="p1", organization_id="o1"))
+    provider = SimpleNamespace(
+        provider=ProviderChoices.LIVEKIT,
+        project=SimpleNamespace(id="p1", organization_id="o1"),
+    )
     assert op.process_and_store_logs([], provider) == op.StoreOutcome(0, 0, 0)
 
 
 def test_process_and_store_logs_non_list_returns_empty_outcome():
     # TWILIO (not VAPI) so the VAPI api-key resolution branch — which would
     # otherwise touch the DB-backed Selector — never runs.
-    provider = SimpleNamespace(provider=ProviderChoices.TWILIO, project=SimpleNamespace(id="p1", organization_id="o1"))
+    provider = SimpleNamespace(
+        provider=ProviderChoices.TWILIO,
+        project=SimpleNamespace(id="p1", organization_id="o1"),
+    )
     assert op.process_and_store_logs("not-a-list", provider) == op.StoreOutcome(0, 0, 0)
 
 
@@ -1502,7 +3212,9 @@ def test_process_and_store_logs_counts_malformed_and_export_failed(monkeypatch):
 
     monkeypatch.setattr(op, "normalize_twilio_data", normalize)
     monkeypatch.setattr(op, "_create_observation_span", lambda *a: SimpleNamespace())
-    monkeypatch.setattr(op, "_export_provider_call_to_collector", lambda *a: 0)  # never acked
+    monkeypatch.setattr(
+        op, "_export_provider_call_to_collector", lambda *a: 0
+    )  # never acked
 
     outcome = op.process_and_store_logs([{"bad": True}, {"id": "c1"}], provider)
     assert outcome == op.StoreOutcome(0, 1, 1)
