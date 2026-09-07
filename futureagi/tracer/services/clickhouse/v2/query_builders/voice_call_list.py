@@ -24,7 +24,8 @@ from tracer.services.clickhouse.v2.query_builders.filters import (
     ClickHouseFilterBuilderV2,
 )
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
-    TraceListQueryBuilderV2,
+    _TraceListQueryBuilderV2Core,
+    _TraceRootReplayV2,
 )
 
 
@@ -36,6 +37,31 @@ class VoiceCallFilterBuilderV2(ClickHouseFilterBuilderV2):
     VOICE_SYSTEM_METRIC_STR_EXPRS = VoiceCallFilterBuilder.VOICE_SYSTEM_METRIC_STR_EXPRS
 
 
+class _VoiceTraceReplayBuilder(_TraceRootReplayV2, TraceListQueryBuilder):
+    """Use the CH25 physical winner for voice membership and page content."""
+
+    def _root_replay_content_fields(self) -> list[tuple[str, str]]:
+        return [
+            ("provider", "provider"),
+            (
+                "concat('{', arrayStringConcat(arrayMap("
+                "kv -> concat(toJSONString(kv.1), ':', kv.2), "
+                "arrayFilter(kv -> kv.1 != 'call_logs', "
+                "JSONExtractKeysAndValuesRaw(toJSONString(attributes_extra)))), ','), '}')",
+                "span_attributes",
+            ),
+            ("mapFilter((k, v) -> k != 'call_logs', attrs_string)", "attrs_string"),
+            ("attrs_number", "attrs_number"),
+            ("attrs_bool", "attrs_bool"),
+        ]
+
+    def _root_replay_content_extra_select(self) -> list[str]:
+        return ["root_span_id AS span_id"]
+
+    def _root_replay_content_join_sql(self) -> str:
+        return ""
+
+
 class VoiceCallListQueryBuilderV2(V2RewriteMixin, VoiceCallListQueryBuilder):
     """Drop-in v2 VoiceCallList builder."""
 
@@ -45,7 +71,42 @@ class VoiceCallListQueryBuilderV2(V2RewriteMixin, VoiceCallListQueryBuilder):
         "AND start_time >= %(start_date)s AND start_time < %(end_date)s"
     )
 
-    def _long_text_candidate_delegate(self) -> TraceListQueryBuilderV2 | None:
+    def _bounded_delegate(
+        self,
+        *,
+        candidate_full_state: bool = False,
+        public_candidate_witness: bool = False,
+        trace_builder_cls: type[TraceListQueryBuilder] = _VoiceTraceReplayBuilder,
+    ) -> _VoiceTraceReplayBuilder:
+        # Share schema-aware logic before this voice builder's sole SQL rewrite.
+        # Internal scan policy and the conversation-root predicate stay intact.
+        return super()._bounded_delegate(
+            candidate_full_state=candidate_full_state,
+            public_candidate_witness=public_candidate_witness,
+            trace_builder_cls=trace_builder_cls,
+        )
+
+    def content_root_identities_for_rows(self, rows):
+        return self._bounded_delegate().content_root_identities_for_rows(rows)
+
+    def content_root_rows_match(self, expected, actual) -> bool:
+        return self._bounded_delegate().content_root_rows_match(expected, actual)
+
+    def build_content_query(self, span_ids, *, root_identities=None):
+        if not span_ids:
+            return "", {}
+        if not root_identities or any(len(item) != 8 for item in root_identities):
+            raise ValueError(
+                "v2 voice content replay requires complete root identities"
+            )
+        if {str(item[2]) for item in root_identities} != set(map(str, span_ids)):
+            raise ValueError("v2 voice content replay identity escaped requested spans")
+        return self._bounded_delegate().build_content_query(
+            list(dict.fromkeys(str(item[1]) for item in root_identities)),
+            root_identities=root_identities,
+        )
+
+    def _long_text_candidate_delegate(self) -> _TraceListQueryBuilderV2Core | None:
         """Reuse CH25's required long-text plan for public voice pages.
 
         The legacy finite witness is optional and cannot run when application
@@ -61,7 +122,7 @@ class VoiceCallListQueryBuilderV2(V2RewriteMixin, VoiceCallListQueryBuilder):
             return None
         delegate = self._bounded_delegate(
             public_candidate_witness=True,
-            trace_builder_cls=TraceListQueryBuilderV2,
+            trace_builder_cls=_TraceListQueryBuilderV2Core,
         )
         if (
             delegate._positive_exact_end_user_seed_filter() is not None

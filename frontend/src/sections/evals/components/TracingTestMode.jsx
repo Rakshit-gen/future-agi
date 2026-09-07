@@ -63,6 +63,9 @@ import { useForm, useWatch } from "react-hook-form";
 import CustomTooltip from "src/components/tooltip";
 import TaskFilterBar from "src/sections/tasks/components/TaskFilterBar";
 import { buildApiFilterArray } from "src/sections/tasks/components/TaskLivePreview";
+import DateRangePill, {
+  dateFilterForOption,
+} from "src/sections/projects/LLMTracing/DateRangePill";
 import { JsonValueTree } from "./DatasetTestMode";
 import EvalResultDisplay from "./EvalResultDisplay";
 import SpanRowList from "./SpanRowList";
@@ -335,9 +338,20 @@ const TracingTestMode = React.forwardRef(
       control: internalFilterForm.control,
       name: "filters",
     });
+    // Keep the existing 30-day preview default visible and editable. Property
+    // discovery includes older values; choosing one must not hide the range
+    // that determines whether its rows appear in this preview.
+    const [previewDateFilter, setPreviewDateFilter] = useState(() => ({
+      dateOption: "30D",
+      dateFilter: dateFilterForOption("30D"),
+    }));
     const internalApiFilters = useMemo(
-      () => buildApiFilterArray(internalFormFilters),
-      [internalFormFilters],
+      () =>
+        buildApiFilterArray(
+          internalFormFilters,
+          ...previewDateFilter.dateFilter,
+        ),
+      [internalFormFilters, previewDateFilter],
     );
     const effectiveFilters = hostsFilter ? internalApiFilters : localFilters;
 
@@ -1624,6 +1638,15 @@ const TracingTestMode = React.forwardRef(
                     : "spans"}{" "}
               to preview
             </Typography>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
+              <Typography variant="caption" color="text.secondary">
+                Preview date range
+              </Typography>
+              <DateRangePill
+                dateFilter={previewDateFilter}
+                setDateFilter={setPreviewDateFilter}
+              />
+            </Box>
             <TaskFilterBar
               control={internalFilterForm.control}
               setValue={internalFilterForm.setValue}
@@ -2083,11 +2106,14 @@ const TracingTestMode = React.forwardRef(
                 fontWeight={600}
                 color="text.secondary"
               >
-                No {rowType.toLowerCase()} data found
+                No matching{" "}
+                {rowType === "VoiceCall"
+                  ? "voice calls"
+                  : `${rowType.toLowerCase()}s`}{" "}
+                found
               </Typography>
               <Typography variant="caption" color="text.disabled">
-                Add {rowType.toLowerCase()} to this project before running a
-                test
+                Try changing the filters or date range.
               </Typography>
             </Box>
           )}

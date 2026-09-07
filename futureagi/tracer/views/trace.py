@@ -269,31 +269,6 @@ def _format_trace_list_created_at(value: datetime) -> str:
     return normalized.isoformat().replace("+00:00", "Z")
 
 
-def _voice_content_identity(
-    project_id: Any,
-    trace_id: Any,
-    span_id: Any,
-    start_time: Any,
-) -> tuple[str, str, str, int] | None:
-    """Normalize a physical root identity at DateTime64(6) precision."""
-
-    project = str(project_id or "")
-    trace = str(trace_id or "")
-    span = str(span_id or "")
-    if not project or not trace or not span or not isinstance(start_time, datetime):
-        return None
-    utc_start = (
-        start_time.replace(tzinfo=UTC)
-        if start_time.tzinfo is None
-        else start_time.astimezone(UTC)
-    )
-    delta = utc_start - datetime(1970, 1, 1, tzinfo=UTC)
-    epoch_microseconds = (
-        delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
-    )
-    return project, trace, span, epoch_microseconds
-
-
 def _clickhouse_error_code(exc: Exception) -> int | None:
     """Extract only the numeric CH code; never expose the server message."""
 
@@ -5671,7 +5646,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         cursor_token = validated_data.get("cursor")
         cursor_requested = bool(cursor_token or validated_data.get("cursor_mode"))
         cursor_scope = cursor_scope_for_request(request, project_ids=[str(project_id)])
-        cursor_query = dict(validated_data)
+        # Old checkpoints used a different root-winner identity and cannot
+        # attest an exact continuation under the CH25 physical replay contract.
+        cursor_query = {
+            **validated_data,
+            "voice_root_contract": "physical-root-winner-v1",
+        }
         cursor_state = None
         cursor_order_token = None
         if cursor_token:
@@ -5908,27 +5888,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         )
 
         # Phase 1b: hydrate only the exact physical roots selected above.
-        # The builder resolves latest versions by (project, trace, id,
-        # start_time), prunes by partition date, applies tombstones, and strips
-        # `call_logs` before transfer. No broad FINAL scan is used.
+        # Replay the complete CH25 physical identity and selected version. The
+        # exact timestamp alone is mutable, and an id can occur in more than
+        # one service. No broad FINAL scan is used.
         page_rows = result.data
-        span_ids = [
-            str(row.get("root_span_id") or row.get("span_id") or "")
-            for row in page_rows
-        ]
         attrs_map = {}
         if page_rows:
-            root_identities = [
-                (
-                    str(row.get("project_id") or project_id),
-                    str(row.get("trace_id") or ""),
-                    str(row.get("root_span_id") or row.get("span_id") or ""),
-                    row.get("start_time"),
-                )
-                for row in page_rows
-            ]
             normalized_root_identities = [
-                _voice_content_identity(*identity) for identity in root_identities
+                builder.bounded_filter_page_hydration_identity(row) for row in page_rows
             ]
             if any(identity is None for identity in normalized_root_identities) or len(
                 set(normalized_root_identities)
@@ -5948,8 +5915,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             content_batch_size = settings.VOICE_CONTENT_MAX_BATCH_SIZE
 
             def hydrate_content_batch(
-                batch_identities: list[tuple[str, str, str, Any]],
-                batch_span_ids: list[str],
+                batch_rows: list[dict[str, Any]],
             ) -> list[dict[str, Any]]:
                 """Hydrate exact roots, splitting only a CH memory failure."""
 
@@ -5958,8 +5924,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     raise ReadDeadlineExceeded(
                         "voice content hydration query budget exceeded"
                     )
+                batch_identities = builder.content_root_identities_for_rows(batch_rows)
                 attrs_query, attrs_params = builder.build_content_query(
-                    batch_span_ids,
+                    [identity[2] for identity in batch_identities],
                     root_identities=batch_identities,
                 )
                 content_query_attempts += 1
@@ -5982,32 +5949,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                         raise
                     midpoint = len(batch_identities) // 2
                     return hydrate_content_batch(
-                        batch_identities[:midpoint],
-                        batch_span_ids[:midpoint],
+                        batch_rows[:midpoint],
                     ) + hydrate_content_batch(
-                        batch_identities[midpoint:],
-                        batch_span_ids[midpoint:],
+                        batch_rows[midpoint:],
                     )
 
-                expected_identities = [
-                    _voice_content_identity(*identity) for identity in batch_identities
-                ]
-                actual_identities = [
-                    _voice_content_identity(
-                        row.get("project_id") or project_id,
-                        row.get("trace_id"),
-                        row.get("span_id"),
-                        row.get("start_time"),
-                    )
-                    for row in attrs_result.data
-                ]
-                if (
-                    any(identity is None for identity in expected_identities)
-                    or any(identity is None for identity in actual_identities)
-                    or len(set(expected_identities)) != len(expected_identities)
-                    or len(set(actual_identities)) != len(actual_identities)
-                    or set(actual_identities) != set(expected_identities)
-                ):
+                if not builder.content_root_rows_match(batch_rows, attrs_result.data):
                     raise VoiceContentHydrationIncomplete(
                         "voice content hydration identity mismatch"
                     )
@@ -6015,29 +5962,15 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
 
             try:
                 hydrated_rows = []
-                for batch_start in range(0, len(root_identities), content_batch_size):
+                for batch_start in range(0, len(page_rows), content_batch_size):
                     batch_end = batch_start + content_batch_size
                     hydrated_rows.extend(
                         hydrate_content_batch(
-                            root_identities[batch_start:batch_end],
-                            span_ids[batch_start:batch_end],
+                            page_rows[batch_start:batch_end],
                         )
                     )
 
-                hydrated_identities = [
-                    _voice_content_identity(
-                        row.get("project_id") or project_id,
-                        row.get("trace_id"),
-                        row.get("span_id"),
-                        row.get("start_time"),
-                    )
-                    for row in hydrated_rows
-                ]
-                if (
-                    any(identity is None for identity in hydrated_identities)
-                    or len(set(hydrated_identities)) != len(hydrated_identities)
-                    or set(hydrated_identities) != set(normalized_root_identities)
-                ):
+                if not builder.content_root_rows_match(page_rows, hydrated_rows):
                     raise VoiceContentHydrationIncomplete(
                         "voice content hydration global identity mismatch"
                     )
@@ -6068,13 +6001,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 )
 
             for arow in hydrated_rows:
-                sid = str(arow.get("span_id", ""))
-                attr_identity = _voice_content_identity(
-                    arow.get("project_id") or project_id,
-                    arow.get("trace_id"),
-                    sid,
-                    arow.get("start_time"),
-                )
+                attr_identity = builder.bounded_filter_page_hydration_identity(arow)
                 raw = arow.get("span_attributes", "{}")
                 try:
                     parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
@@ -6192,12 +6119,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             provider = row.get("provider") or "vapi"
 
             # Get span_attributes from CH CDC table (Phase 1b)
-            attr_identity = _voice_content_identity(
-                row.get("project_id") or project_id,
-                trace_id,
-                span_id,
-                row.get("start_time"),
-            )
+            attr_identity = builder.bounded_filter_page_hydration_identity(row)
             attr_row = attrs_map.get(attr_identity, {})
             span_attrs = attr_row.get("span_attributes") or {}
             provider = attr_row.get("provider") or provider

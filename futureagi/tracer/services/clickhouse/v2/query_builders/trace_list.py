@@ -1,14 +1,10 @@
 """
 v2 TraceList query builder — targets the CH 25.3 spans schema.
 
-Same pattern as v2/span_list.py: SUBCLASS the v1 builder, rewrite the
-compiled SQL output. The v1 TraceList builder reads from `spans` (legacy
-24.10 columns) plus joins to `tracer_eval_logger` and `model_hub_score`.
-
-`V2RewriteMixin` routes every inherited `build*` method's SQL through the v2
-rewriter at one boundary (no per-method overrides). The only locally-defined
-method is `build_count_query`, which carries a rollup fast-path; its SQL is
-rewritten by the mixin just like every other.
+The schema-aware core reuses the legacy filter planner. Physical replacement
+and page replay live in a separate mixin shared with voice calls, so callers
+can adopt the CH25 identity contract without changing acquisition policies.
+`V2RewriteMixin` translates SQL at the public builder boundary.
 
 `build_eval_query` / `build_annotation_query` are excluded from the span-column
 rewrite. The eval query follows the independently configured authoritative
@@ -82,15 +78,362 @@ class UserEnrichmentLimitExceeded(ReadDeadlineExceeded):
     """A page's remap fan-in exceeded the optional enrichment read bound."""
 
 
-class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
-    """Drop-in v2 TraceList builder.
+class _TraceRootReplayV2:
+    """CH25 physical replacement and hydration, independent of acquisition policy."""
 
-    Callers swap one import line:
-        v1: from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
-        v2: from tracer.services.clickhouse.v2.query_builders.trace_list  import TraceListQueryBuilderV2
+    @staticmethod
+    def filter_classifier_has_exact_start_time_identity() -> bool:
+        """CH25 replacement identity uses start hour, not exact producer time."""
 
-    Or route via the shadow harness in v2/shadow.py.
-    """
+        return False
+
+    @staticmethod
+    def filter_classifier_physical_group_by(*, org_scope: bool) -> str:
+        """Collapse by the complete deployed CH25 ReplacingMergeTree key."""
+
+        project_prefix = "project_id, " if org_scope else ""
+        return (
+            f"{project_prefix}observation_type, service_name, "
+            "toStartOfHour(start_time), trace_id, id"
+        )
+
+    @staticmethod
+    def _filter_project_version_is_immutable() -> bool:
+        return False
+
+    @staticmethod
+    def _filter_classifier_root_order() -> str:
+        return (
+            "tuple(latest_start_time, grouped_id, grouped_root_observation_type, "
+            "grouped_root_service_name, grouped_root_start_hour)"
+        )
+
+    @staticmethod
+    def _filter_classifier_root_identity_fields() -> tuple[tuple[str, str], ...]:
+        return (
+            ("grouped_id", "root_span_id"),
+            ("latest_start_time", "start_time"),
+            ("grouped_root_observation_type", "_root_observation_type"),
+            ("grouped_root_service_name", "_root_service_name"),
+            ("grouped_root_start_hour", "_root_start_hour"),
+            ("latest_root_version", "_root_version"),
+        )
+
+    @staticmethod
+    def _filter_classifier_latest_select_sql(aggregate_sql: str) -> str:
+        """Pack the compiler's argMax expressions into ONE physical winner.
+
+        This consumes only the closed aggregate grammar emitted by the legacy
+        classifier/latest-predicate compiler, never user SQL. Fail closed if a
+        future compiler emits a different aggregate rather than mixing winners.
+        Tuple wrapping preserves NULLs, including tuple-valued plan arguments.
+        Equal-version conflicts have no unique storage winner; one tuple still
+        prevents constructing a row from fields of different tied versions.
+        """
+        pattern = re.compile(
+            r"\s*argMax\((.*?),\s*_peerdb_version\)(\.1)?\s+AS\s+(\w+)\s*(?:,|$)",
+            re.DOTALL,
+        )
+        values, aliases = [], []
+        position = 0
+        while aggregate_sql[position:].strip():
+            match = pattern.match(aggregate_sql, position)
+            if match is None:
+                raise ValueError("unsupported latest trace aggregate")
+            source, suffix, alias = match.groups()
+            values.append(source)
+            aliases.append(f"_physical_winner.{len(values)}{suffix or ''} AS {alias}")
+            position = match.end()
+        values.extend(("_peerdb_version", "project_version_id"))
+        aliases.extend(
+            (
+                f"_physical_winner.{len(values) - 1} AS latest_root_version",
+                f"_physical_winner.{len(values)} AS _latest_root_project_version",
+            )
+        )
+        return ",\n".join(
+            [
+                "observation_type AS grouped_root_observation_type",
+                "service_name AS grouped_root_service_name",
+                "toStartOfHour(start_time) AS grouped_root_start_hour",
+                f"argMax(tuple({', '.join(values)}), _peerdb_version) AS _physical_winner",
+                *aliases,
+            ]
+        )
+
+    def _validated_root_identity(self, row: dict[str, Any]) -> tuple:
+        """Full immutable storage key plus the observed time/version, or fail closed."""
+        project = str(row.get("project_id") or self.project_id or "")
+        allowed = (
+            set(self.project_ids or ())
+            if self.project_ids is not None
+            else {str(self.project_id)}
+        )
+        start, hour = row.get("start_time"), row.get("_root_start_hour")
+        kind, service = row.get("_root_observation_type"), row.get("_root_service_name")
+        version = row.get("_root_version")
+        if (
+            project not in allowed
+            or not row.get("trace_id")
+            or not row.get("root_span_id")
+            or not isinstance(start, datetime)
+            or not isinstance(hour, datetime)
+            or not isinstance(kind, str)
+            or not kind
+            or not isinstance(service, str)
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 0
+        ):
+            raise ValueError(
+                "v2 trace hydration requires a complete scoped root identity"
+            )
+        start_us, hour_us = _unix_microseconds(start), _unix_microseconds(hour)
+        if hour_us != start_us // 3_600_000_000 * 3_600_000_000:
+            raise ValueError(
+                "v2 trace hydration root hour does not contain latest time"
+            )
+        # Keep the legacy prefix for callers; physical scan coordinates below
+        # deliberately use the hour instead of the mutable exact timestamp.
+        return (
+            project,
+            str(row["trace_id"]),
+            str(row["root_span_id"]),
+            start_us,
+            kind,
+            service,
+            hour_us,
+            version,
+        )
+
+    def bounded_filter_page_hydration_identity(
+        self, row: dict[str, Any]
+    ) -> tuple | None:
+        # Missing/malformed replay metadata is drift, not an exception that
+        # bypasses the selector's existing unhydrated-checkpoint rollback.
+        try:
+            return self._validated_root_identity(row)
+        except ValueError:
+            return None
+
+    def content_root_identities_for_rows(
+        self, rows: list[dict[str, Any]]
+    ) -> list[tuple]:
+        return [self._validated_root_identity(row) for row in rows]
+
+    def content_root_rows_match(
+        self, expected: list[dict[str, Any]], actual: list[dict[str, Any]]
+    ) -> bool:
+        try:
+            expected_ids = self.content_root_identities_for_rows(expected)
+            actual_ids = self.content_root_identities_for_rows(actual)
+        except ValueError:
+            return False
+        return (
+            len(set(expected_ids)) == len(expected_ids)
+            and len(actual_ids) == len(expected_ids)
+            and set(actual_ids) == set(expected_ids)
+        )
+
+    def _root_replay_content_fields(self) -> list[tuple[str, str]]:
+        return [
+            ("input", "input"),
+            ("output", "output"),
+            ("attrs_string", "attrs_string"),
+            ("attrs_number", "attrs_number"),
+            ("attrs_bool", "attrs_bool"),
+            ("attributes_extra", "attributes_extra"),
+            ("metadata", "metadata"),
+        ]
+
+    def _root_replay_content_extra_select(self) -> list[str]:
+        return [self._trace_tags_select_sql()]
+
+    def _root_replay_content_join_sql(self) -> str:
+        return self._trace_tags_join_sql()
+
+    def _root_replay_query(
+        self, identities: list[tuple], *, content: bool
+    ) -> tuple[str, dict[str, Any]]:
+        """Replay the finite page by immutable coordinates, with no time/version prefilter."""
+        if not identities:
+            return "", {}
+        if len(identities) > 512 or len(
+            {identity[:2] for identity in identities}
+        ) != len(identities):
+            raise ValueError(
+                "trace replay requires one bounded root per trace identity"
+            )
+        prefix = "content" if content else "page_hydration"
+        params = {
+            **self.params,
+            f"{prefix}_trace_ids": tuple(
+                dict.fromkeys(identity[1] for identity in identities)
+            ),
+            f"{prefix}_root_identities": tuple(identities),
+            f"{prefix}_physical_keys": tuple(
+                (
+                    project,
+                    kind,
+                    service,
+                    datetime.fromtimestamp(hour // 1_000_000, UTC).replace(tzinfo=None),
+                    trace,
+                    span,
+                )
+                for project, trace, span, _, kind, service, hour, _ in identities
+            ),
+            # Expose native primary-index coordinates independently of the
+            # String-cast project identity and ORDER BY-only span suffix.
+            # This redundant superset improves sparse-index pruning without
+            # filtering mutable time/version/content before replacement.
+            f"{prefix}_primary_prefixes": tuple(
+                dict.fromkeys(
+                    (
+                        kind,
+                        service,
+                        datetime.fromtimestamp(hour // 1_000_000, UTC).replace(
+                            tzinfo=None
+                        ),
+                        trace,
+                    )
+                    for _, trace, _, _, kind, service, hour, _ in identities
+                )
+            ),
+        }
+        # Each source expression is inside the same tuple, so a newer NULL
+        # replaces an old value instead of argMax skipping it.
+        fields = [
+            ("start_time", "start_time"),
+            ("parent_span_id", "latest_parent_span_id"),
+            ("is_deleted", "latest_is_deleted"),
+            ("project_version_id", "latest_project_version_id"),
+            ("_version", "_root_version"),
+        ]
+        if content:
+            fields += self._root_replay_content_fields()
+        else:
+            fields += [
+                ("trace_name", "trace_name"),
+                ("name", "span_name"),
+                ("status", "status"),
+                ("end_time", "end_time"),
+                ("latency_ms", "latency_ms"),
+                ("cost", "cost"),
+                ("total_tokens", "total_tokens"),
+                ("prompt_tokens", "prompt_tokens"),
+                ("completion_tokens", "completion_tokens"),
+                ("model", "model"),
+                ("provider", "provider"),
+                ("trace_session_id", "trace_session_id"),
+            ]
+        projected = [
+            f"_root_snapshot.{index} AS {alias}"
+            for index, (_, alias) in enumerate(fields, start=1)
+        ]
+        selected = [
+            "toString(project_id) AS project_id",
+            "trace_id",
+            "root_span_id",
+            "start_time",
+            "_root_observation_type",
+            "_root_service_name",
+            "_root_start_hour",
+            "_root_version",
+        ]
+        selected += [
+            "toJSONString(metadata) AS metadata" if alias == "metadata" else alias
+            for _, alias in fields[5:]
+        ]
+        if content:
+            selected.extend(self._root_replay_content_extra_select())
+        else:
+            selected.append("_root_observation_type AS observation_type")
+        project_version = ""
+        if self.project_version_id:
+            params["project_version_id"] = self.project_version_id
+            project_version = "AND latest_project_version_id = %(project_version_id)s"
+        query = f"""
+        SELECT {", ".join(selected)}
+        FROM (
+            SELECT project_id, trace_id, root_span_id,
+                _root_observation_type, _root_service_name, _root_start_hour,
+                {", ".join(projected)}
+            FROM (
+                SELECT project_id, trace_id, id AS root_span_id,
+                    observation_type AS _root_observation_type,
+                    service_name AS _root_service_name,
+                    toStartOfHour(start_time) AS _root_start_hour,
+                    argMax(tuple({", ".join(source for source, _ in fields)}), _version) AS _root_snapshot
+                FROM {self.TABLE}
+                PREWHERE {self.project_filter_sql()}
+                  AND (observation_type, service_name,
+                       toStartOfHour(start_time), trace_id)
+                      IN %({prefix}_primary_prefixes)s
+                  AND (toString(project_id), observation_type, service_name,
+                       toStartOfHour(start_time), trace_id, id)
+                      IN %({prefix}_physical_keys)s
+                GROUP BY project_id, observation_type, service_name, toStartOfHour(start_time), trace_id, id
+            ) AS replayed_root_versions
+        ) AS latest_physical_roots
+        {self._root_replay_content_join_sql() if content else ""}
+        WHERE latest_is_deleted = 0
+          AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
+          {project_version}
+        ORDER BY start_time DESC, trace_id DESC, project_id DESC
+        LIMIT {len(identities)}
+        """
+        return query, params
+
+    def build_filter_page_hydration_query(
+        self, candidate_rows: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, Any]]:
+        return self._root_replay_query(
+            self.content_root_identities_for_rows(candidate_rows), content=False
+        )
+
+    def build_content_query(
+        self, trace_ids: list[str], *, root_identities: list[tuple] | None = None
+    ) -> tuple[str, dict[str, Any]]:
+        if not trace_ids:
+            return "", {}
+        if not root_identities or any(
+            len(identity) != 8 for identity in root_identities
+        ):
+            raise ValueError(
+                "v2 content replay requires complete root identities; no four-part fallback"
+            )
+        rows = []
+        for (
+            project,
+            trace,
+            span,
+            start,
+            kind,
+            service,
+            hour,
+            version,
+        ) in root_identities:
+            rows.append(
+                {
+                    "project_id": project,
+                    "trace_id": trace,
+                    "root_span_id": span,
+                    "start_time": datetime.fromtimestamp(
+                        start // 1_000_000, UTC
+                    ).replace(microsecond=start % 1_000_000),
+                    "_root_observation_type": kind,
+                    "_root_service_name": service,
+                    "_root_start_hour": datetime.fromtimestamp(hour // 1_000_000, UTC),
+                    "_root_version": version,
+                }
+            )
+        identities = self.content_root_identities_for_rows(rows)
+        if {identity[1] for identity in identities} != set(map(str, trace_ids)):
+            raise ValueError("v2 content replay identity escaped requested traces")
+        return self._root_replay_query(identities, content=True)
+
+class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
+    """Schema-aware planner shared before the public SQL rewrite boundary."""
 
     _v2_rewrite_exclude = frozenset(
         {
@@ -468,348 +811,6 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
             if self._uses_attribute_coordinate_replay()
             else super().prefer_filter_candidate_witness_probe_first()
         )
-
-    @staticmethod
-    def filter_classifier_has_exact_start_time_identity() -> bool:
-        """CH25 replacement identity uses start hour, not exact producer time."""
-
-        return False
-
-    @staticmethod
-    def filter_classifier_physical_group_by(*, org_scope: bool) -> str:
-        """Collapse by the complete deployed CH25 ReplacingMergeTree key."""
-
-        project_prefix = "project_id, " if org_scope else ""
-        return (
-            f"{project_prefix}observation_type, service_name, "
-            "toStartOfHour(start_time), trace_id, id"
-        )
-
-    @staticmethod
-    def _filter_project_version_is_immutable() -> bool:
-        return False
-
-    @staticmethod
-    def _filter_classifier_root_order() -> str:
-        return (
-            "tuple(latest_start_time, grouped_id, grouped_root_observation_type, "
-            "grouped_root_service_name, grouped_root_start_hour)"
-        )
-
-    @staticmethod
-    def _filter_classifier_root_identity_fields() -> tuple[tuple[str, str], ...]:
-        return (
-            ("grouped_id", "root_span_id"),
-            ("latest_start_time", "start_time"),
-            ("grouped_root_observation_type", "_root_observation_type"),
-            ("grouped_root_service_name", "_root_service_name"),
-            ("grouped_root_start_hour", "_root_start_hour"),
-            ("latest_root_version", "_root_version"),
-        )
-
-    @staticmethod
-    def _filter_classifier_latest_select_sql(aggregate_sql: str) -> str:
-        """Pack the compiler's argMax expressions into ONE physical winner.
-
-        This consumes only the closed aggregate grammar emitted by the legacy
-        classifier/latest-predicate compiler, never user SQL. Fail closed if a
-        future compiler emits a different aggregate rather than mixing winners.
-        Tuple wrapping preserves NULLs, including tuple-valued plan arguments.
-        Equal-version conflicts have no unique storage winner; one tuple still
-        prevents constructing a row from fields of different tied versions.
-        """
-        pattern = re.compile(
-            r"\s*argMax\((.*?),\s*_peerdb_version\)(\.1)?\s+AS\s+(\w+)\s*(?:,|$)",
-            re.DOTALL,
-        )
-        values, aliases = [], []
-        position = 0
-        while aggregate_sql[position:].strip():
-            match = pattern.match(aggregate_sql, position)
-            if match is None:
-                raise ValueError("unsupported latest trace aggregate")
-            source, suffix, alias = match.groups()
-            values.append(source)
-            aliases.append(f"_physical_winner.{len(values)}{suffix or ''} AS {alias}")
-            position = match.end()
-        values.extend(("_peerdb_version", "project_version_id"))
-        aliases.extend(
-            (
-                f"_physical_winner.{len(values) - 1} AS latest_root_version",
-                f"_physical_winner.{len(values)} AS _latest_root_project_version",
-            )
-        )
-        return ",\n".join(
-            [
-                "observation_type AS grouped_root_observation_type",
-                "service_name AS grouped_root_service_name",
-                "toStartOfHour(start_time) AS grouped_root_start_hour",
-                f"argMax(tuple({', '.join(values)}), _peerdb_version) AS _physical_winner",
-                *aliases,
-            ]
-        )
-
-    def _validated_root_identity(self, row: dict[str, Any]) -> tuple:
-        """Full immutable storage key plus the observed time/version, or fail closed."""
-        project = str(row.get("project_id") or self.project_id or "")
-        allowed = (
-            set(self.project_ids or ())
-            if self.project_ids is not None
-            else {str(self.project_id)}
-        )
-        start, hour = row.get("start_time"), row.get("_root_start_hour")
-        kind, service = row.get("_root_observation_type"), row.get("_root_service_name")
-        version = row.get("_root_version")
-        if (
-            project not in allowed
-            or not row.get("trace_id")
-            or not row.get("root_span_id")
-            or not isinstance(start, datetime)
-            or not isinstance(hour, datetime)
-            or not isinstance(kind, str)
-            or not kind
-            or not isinstance(service, str)
-            or not isinstance(version, int)
-            or isinstance(version, bool)
-            or version < 0
-        ):
-            raise ValueError(
-                "v2 trace hydration requires a complete scoped root identity"
-            )
-        start_us, hour_us = _unix_microseconds(start), _unix_microseconds(hour)
-        if hour_us != start_us // 3_600_000_000 * 3_600_000_000:
-            raise ValueError(
-                "v2 trace hydration root hour does not contain latest time"
-            )
-        # Keep the legacy prefix for callers; physical scan coordinates below
-        # deliberately use the hour instead of the mutable exact timestamp.
-        return (
-            project,
-            str(row["trace_id"]),
-            str(row["root_span_id"]),
-            start_us,
-            kind,
-            service,
-            hour_us,
-            version,
-        )
-
-    def bounded_filter_page_hydration_identity(
-        self, row: dict[str, Any]
-    ) -> tuple | None:
-        # Missing/malformed replay metadata is drift, not an exception that
-        # bypasses the selector's existing unhydrated-checkpoint rollback.
-        try:
-            return self._validated_root_identity(row)
-        except ValueError:
-            return None
-
-    def content_root_identities_for_rows(
-        self, rows: list[dict[str, Any]]
-    ) -> list[tuple]:
-        return [self._validated_root_identity(row) for row in rows]
-
-    def content_root_rows_match(
-        self, expected: list[dict[str, Any]], actual: list[dict[str, Any]]
-    ) -> bool:
-        try:
-            expected_ids = self.content_root_identities_for_rows(expected)
-            actual_ids = self.content_root_identities_for_rows(actual)
-        except ValueError:
-            return False
-        return (
-            len(set(expected_ids)) == len(expected_ids)
-            and len(actual_ids) == len(expected_ids)
-            and set(actual_ids) == set(expected_ids)
-        )
-
-    def _root_replay_query(
-        self, identities: list[tuple], *, content: bool
-    ) -> tuple[str, dict[str, Any]]:
-        """Replay the finite page by immutable coordinates, with no time/version prefilter."""
-        if not identities:
-            return "", {}
-        if len(identities) > 512 or len(
-            {identity[:2] for identity in identities}
-        ) != len(identities):
-            raise ValueError(
-                "trace replay requires one bounded root per trace identity"
-            )
-        prefix = "content" if content else "page_hydration"
-        params = {
-            **self.params,
-            f"{prefix}_trace_ids": tuple(
-                dict.fromkeys(identity[1] for identity in identities)
-            ),
-            f"{prefix}_root_identities": tuple(identities),
-            f"{prefix}_physical_keys": tuple(
-                (
-                    project,
-                    kind,
-                    service,
-                    datetime.fromtimestamp(hour // 1_000_000, UTC).replace(tzinfo=None),
-                    trace,
-                    span,
-                )
-                for project, trace, span, _, kind, service, hour, _ in identities
-            ),
-            # Expose native primary-index coordinates independently of the
-            # String-cast project identity and ORDER BY-only span suffix.
-            # This redundant superset improves sparse-index pruning without
-            # filtering mutable time/version/content before replacement.
-            f"{prefix}_primary_prefixes": tuple(
-                dict.fromkeys(
-                    (
-                        kind,
-                        service,
-                        datetime.fromtimestamp(hour // 1_000_000, UTC).replace(
-                            tzinfo=None
-                        ),
-                        trace,
-                    )
-                    for _, trace, _, _, kind, service, hour, _ in identities
-                )
-            ),
-        }
-        # Each source expression is inside the same tuple, so a newer NULL
-        # replaces an old value instead of argMax skipping it.
-        fields = [
-            ("start_time", "start_time"),
-            ("parent_span_id", "latest_parent_span_id"),
-            ("is_deleted", "latest_is_deleted"),
-            ("project_version_id", "latest_project_version_id"),
-            ("_version", "_root_version"),
-        ]
-        if content:
-            fields += [
-                ("input", "input"),
-                ("output", "output"),
-                ("attrs_string", "attrs_string"),
-                ("attrs_number", "attrs_number"),
-                ("attrs_bool", "attrs_bool"),
-                ("attributes_extra", "attributes_extra"),
-                ("metadata", "metadata"),
-            ]
-        else:
-            fields += [
-                ("trace_name", "trace_name"),
-                ("name", "span_name"),
-                ("status", "status"),
-                ("end_time", "end_time"),
-                ("latency_ms", "latency_ms"),
-                ("cost", "cost"),
-                ("total_tokens", "total_tokens"),
-                ("prompt_tokens", "prompt_tokens"),
-                ("completion_tokens", "completion_tokens"),
-                ("model", "model"),
-                ("provider", "provider"),
-                ("trace_session_id", "trace_session_id"),
-            ]
-        projected = [
-            f"_root_snapshot.{index} AS {alias}"
-            for index, (_, alias) in enumerate(fields, start=1)
-        ]
-        selected = [
-            "toString(project_id) AS project_id",
-            "trace_id",
-            "root_span_id",
-            "start_time",
-            "_root_observation_type",
-            "_root_service_name",
-            "_root_start_hour",
-            "_root_version",
-        ]
-        selected += [
-            "toJSONString(metadata) AS metadata" if alias == "metadata" else alias
-            for _, alias in fields[5:]
-        ]
-        if content:
-            selected.append(self._trace_tags_select_sql())
-        else:
-            selected.append("_root_observation_type AS observation_type")
-        project_version = ""
-        if self.project_version_id:
-            params["project_version_id"] = self.project_version_id
-            project_version = "AND latest_project_version_id = %(project_version_id)s"
-        query = f"""
-        SELECT {", ".join(selected)}
-        FROM (
-            SELECT project_id, trace_id, root_span_id,
-                _root_observation_type, _root_service_name, _root_start_hour,
-                {", ".join(projected)}
-            FROM (
-                SELECT project_id, trace_id, id AS root_span_id,
-                    observation_type AS _root_observation_type,
-                    service_name AS _root_service_name,
-                    toStartOfHour(start_time) AS _root_start_hour,
-                    argMax(tuple({", ".join(source for source, _ in fields)}), _version) AS _root_snapshot
-                FROM {self.TABLE}
-                PREWHERE {self.project_filter_sql()}
-                  AND (observation_type, service_name,
-                       toStartOfHour(start_time), trace_id)
-                      IN %({prefix}_primary_prefixes)s
-                  AND (toString(project_id), observation_type, service_name,
-                       toStartOfHour(start_time), trace_id, id)
-                      IN %({prefix}_physical_keys)s
-                GROUP BY project_id, observation_type, service_name, toStartOfHour(start_time), trace_id, id
-            ) AS replayed_root_versions
-        ) AS latest_physical_roots
-        {self._trace_tags_join_sql() if content else ""}
-        WHERE latest_is_deleted = 0
-          AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
-          {project_version}
-        ORDER BY start_time DESC, trace_id DESC, project_id DESC
-        LIMIT {len(identities)}
-        """
-        return query, params
-
-    def build_filter_page_hydration_query(
-        self, candidate_rows: list[dict[str, Any]]
-    ) -> tuple[str, dict[str, Any]]:
-        return self._root_replay_query(
-            self.content_root_identities_for_rows(candidate_rows), content=False
-        )
-
-    def build_content_query(
-        self, trace_ids: list[str], *, root_identities: list[tuple] | None = None
-    ) -> tuple[str, dict[str, Any]]:
-        if not trace_ids:
-            return "", {}
-        if not root_identities or any(
-            len(identity) != 8 for identity in root_identities
-        ):
-            raise ValueError(
-                "v2 content replay requires complete root identities; no four-part fallback"
-            )
-        rows = []
-        for (
-            project,
-            trace,
-            span,
-            start,
-            kind,
-            service,
-            hour,
-            version,
-        ) in root_identities:
-            rows.append(
-                {
-                    "project_id": project,
-                    "trace_id": trace,
-                    "root_span_id": span,
-                    "start_time": datetime.fromtimestamp(
-                        start // 1_000_000, UTC
-                    ).replace(microsecond=start % 1_000_000),
-                    "_root_observation_type": kind,
-                    "_root_service_name": service,
-                    "_root_start_hour": datetime.fromtimestamp(hour // 1_000_000, UTC),
-                    "_root_version": version,
-                }
-            )
-        identities = self.content_root_identities_for_rows(rows)
-        if {identity[1] for identity in identities} != set(map(str, trace_ids)):
-            raise ValueError("v2 content replay identity escaped requested traces")
-        return self._root_replay_query(identities, content=True)
 
     def build_span_attributes_query(
         self,
@@ -1328,6 +1329,10 @@ class TraceListQueryBuilderV2(V2RewriteMixin, TraceListQueryBuilder):
 
         # Slow path: v1's raw uniq over spans; the mixin rewrites + applies SETTINGS.
         return super().build_count_query()
+
+
+class TraceListQueryBuilderV2(V2RewriteMixin, _TraceListQueryBuilderV2Core):
+    """Public CH25 trace builder: rewrite the shared planner's output once."""
 
 
 __all__ = [

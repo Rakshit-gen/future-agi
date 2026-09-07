@@ -9350,14 +9350,16 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
     second_started = END - timedelta(minutes=2)
     first_page = BoundedFilterPage(
         rows=[
-            {
-                "project_id": PROJECT_ID,
-                "trace_id": "trace-b",
-                "root_span_id": "root-b",
-                "span_id": "root-b",
-                "start_time": first_started,
-                "end_time": first_started + timedelta(seconds=5),
-            }
+            _voice_root_row(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-b",
+                    "root_span_id": "root-b",
+                    "span_id": "root-b",
+                    "start_time": first_started,
+                    "end_time": first_started + timedelta(seconds=5),
+                }
+            )
         ],
         has_more=True,
         complete=True,
@@ -9372,14 +9374,16 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
     )
     terminal_page = BoundedFilterPage(
         rows=[
-            {
-                "project_id": PROJECT_ID,
-                "trace_id": "trace-a",
-                "root_span_id": "root-a",
-                "span_id": "root-a",
-                "start_time": second_started,
-                "end_time": second_started + timedelta(seconds=5),
-            }
+            _voice_root_row(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "span_id": "root-a",
+                    "start_time": second_started,
+                    "end_time": second_started + timedelta(seconds=5),
+                }
+            )
         ],
         has_more=False,
         complete=True,
@@ -9400,20 +9404,22 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
 
     def hydrate_cursor_page(_query, params, **_kwargs):
         hydrated = []
-        for span_id in params["content_span_ids"]:
+        for span_id in [identity[2] for identity in params["content_root_identities"]]:
             selected = cursor_rows_by_span_id[span_id]
             hydrated.append(
-                {
-                    "project_id": selected["project_id"],
-                    "trace_id": selected["trace_id"],
-                    "span_id": span_id,
-                    "start_time": selected["start_time"],
-                    "span_attributes": "{}",
-                    "attrs_string": {},
-                    "attrs_number": {},
-                    "attrs_bool": {},
-                    "provider": "vapi",
-                }
+                _voice_root_row(
+                    {
+                        "project_id": selected["project_id"],
+                        "trace_id": selected["trace_id"],
+                        "span_id": span_id,
+                        "start_time": selected["start_time"],
+                        "span_attributes": "{}",
+                        "attrs_string": {},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                        "provider": "vapi",
+                    }
+                )
             )
         return QueryResult(
             data=hydrated,
@@ -9466,7 +9472,7 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
             cursor,
             resource="voice_calls",
             scope=cursor_scope_for_request(request, project_ids=[PROJECT_ID]),
-            query=initial_data,
+            query={**initial_data, "voice_root_contract": "physical-root-winner-v1"},
             page_size=1,
         )
         continuation_data = {
@@ -9504,21 +9510,72 @@ def test_voice_cursor_freezes_snapshot_and_continues_by_root_order(
     assert "additional_table_filters" not in continuation_call["read_settings"]
 
 
+def test_voice_cursor_rejects_legacy_root_contract_before_reads() -> None:
+    from tracer.services.clickhouse.list_cursor import (
+        ListCursorError,
+        cursor_scope_for_request,
+        encode_list_cursor,
+    )
+    from tracer.views.trace import TraceView
+
+    request = _observe_trace_request({"cursor_mode": "true"})
+    data = {
+        "filters": [_time_filter()],
+        "page": 1,
+        "page_size": 25,
+        "cursor_mode": True,
+    }
+    old_cursor = encode_list_cursor(
+        resource="voice_calls",
+        scope=cursor_scope_for_request(request, project_ids=[PROJECT_ID]),
+        query=data,
+        page_size=25,
+        window_start=START.replace(tzinfo=UTC),
+        window_end=END.replace(tzinfo=UTC),
+        order=(END.replace(tzinfo=UTC), "trace-z"),
+        seen_rows=25,
+    )
+    analytics = mock.MagicMock()
+    view = TraceView.__new__(TraceView)
+
+    with (
+        mock.patch("tracer.views.trace.get_project_eval_configs") as eval_configs,
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page"
+        ) as reader,
+        pytest.raises(ListCursorError) as error,
+    ):
+        view._list_voice_calls_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={**data, "cursor": old_cursor},
+            remove_simulation_calls=False,
+            analytics=analytics,
+        )
+
+    assert error.value.code == "cursor_mismatch"
+    eval_configs.assert_not_called()
+    reader.assert_not_called()
+    analytics.execute_ch_query.assert_not_called()
+
+
 def test_voice_page_size_500_cursor_publishes_safe_exact_partial_chunk() -> None:
     from tracer.views.trace import TraceView
 
     started = END - timedelta(minutes=1)
     bounded_page = BoundedFilterPage(
         rows=[
-            {
-                "project_id": PROJECT_ID,
-                "trace_id": "trace-a",
-                "root_span_id": "root-a",
-                "span_id": "root-a",
-                "start_time": started,
-                "end_time": started + timedelta(seconds=12),
-                "provider": "vapi",
-            }
+            _voice_root_row(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "span_id": "root-a",
+                    "start_time": started,
+                    "end_time": started + timedelta(seconds=12),
+                    "provider": "vapi",
+                }
+            )
         ],
         has_more=False,
         complete=False,
@@ -9537,17 +9594,19 @@ def test_voice_page_size_500_cursor_publishes_safe_exact_partial_chunk() -> None
     )
     content_result = QueryResult(
         data=[
-            {
-                "project_id": PROJECT_ID,
-                "trace_id": "trace-a",
-                "span_id": "root-a",
-                "start_time": started,
-                "span_attributes": "{}",
-                "attrs_string": {},
-                "attrs_number": {},
-                "attrs_bool": {},
-                "provider": "vapi",
-            }
+            _voice_root_row(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "span_id": "root-a",
+                    "start_time": started,
+                    "span_attributes": "{}",
+                    "attrs_string": {},
+                    "attrs_number": {},
+                    "attrs_bool": {},
+                    "provider": "vapi",
+                }
+            )
         ],
         row_count=1,
         backend_used="clickhouse",
@@ -9745,15 +9804,17 @@ def test_voice_first_page_explicit_sample_hydrates_only_proven_rows() -> None:
     started = END - timedelta(minutes=1)
     bounded_page = BoundedFilterPage(
         rows=[
-            {
-                "project_id": PROJECT_ID,
-                "trace_id": "trace-a",
-                "root_span_id": "root-a",
-                "span_id": "root-a",
-                "start_time": started,
-                "end_time": started + timedelta(seconds=12),
-                "provider": "vapi",
-            }
+            _voice_root_row(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "span_id": "root-a",
+                    "start_time": started,
+                    "end_time": started + timedelta(seconds=12),
+                    "provider": "vapi",
+                }
+            )
         ],
         has_more=False,
         complete=False,
@@ -9768,17 +9829,19 @@ def test_voice_first_page_explicit_sample_hydrates_only_proven_rows() -> None:
     )
     content_result = QueryResult(
         data=[
-            {
-                "project_id": PROJECT_ID,
-                "trace_id": "trace-a",
-                "span_id": "root-a",
-                "start_time": started,
-                "span_attributes": '{"final_status":"Rejected"}',
-                "attrs_string": {},
-                "attrs_number": {},
-                "attrs_bool": {},
-                "provider": "vapi",
-            }
+            _voice_root_row(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "span_id": "root-a",
+                    "start_time": started,
+                    "span_attributes": '{"final_status":"Rejected"}',
+                    "attrs_string": {},
+                    "attrs_number": {},
+                    "attrs_bool": {},
+                    "provider": "vapi",
+                }
+            )
         ],
         row_count=1,
         backend_used="clickhouse",
@@ -9838,15 +9901,17 @@ def test_voice_page_size_500_hydrates_content_in_bounded_batches() -> None:
     from tracer.views.trace import TraceView
 
     page_rows = [
-        {
-            "project_id": PROJECT_ID,
-            "trace_id": f"trace-{index:03d}",
-            "root_span_id": f"root-{index:03d}",
-            "span_id": f"root-{index:03d}",
-            "start_time": END - timedelta(microseconds=index + 1),
-            "end_time": END - timedelta(microseconds=index + 1),
-            "provider": "vapi",
-        }
+        _voice_root_row(
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": f"trace-{index:03d}",
+                "root_span_id": f"root-{index:03d}",
+                "span_id": f"root-{index:03d}",
+                "start_time": END - timedelta(microseconds=index + 1),
+                "end_time": END - timedelta(microseconds=index + 1),
+                "provider": "vapi",
+            }
+        )
         for index in range(500)
     ]
     row_by_span_id = {row["span_id"]: row for row in page_rows}
@@ -9866,20 +9931,22 @@ def test_voice_page_size_500_hydrates_content_in_bounded_batches() -> None:
 
     def hydrate_batch(_query, params, **_kwargs):
         rows = []
-        for span_id in params["content_span_ids"]:
+        for span_id in [identity[2] for identity in params["content_root_identities"]]:
             selected = row_by_span_id[span_id]
             rows.append(
-                {
-                    "project_id": PROJECT_ID,
-                    "trace_id": selected["trace_id"],
-                    "span_id": span_id,
-                    "start_time": selected["start_time"],
-                    "span_attributes": "{}",
-                    "attrs_string": {},
-                    "attrs_number": {},
-                    "attrs_bool": {},
-                    "provider": "vapi",
-                }
+                _voice_root_row(
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": selected["trace_id"],
+                        "span_id": span_id,
+                        "start_time": selected["start_time"],
+                        "span_attributes": "{}",
+                        "attrs_string": {},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                        "provider": "vapi",
+                    }
+                )
             )
         return QueryResult(
             data=rows,
@@ -9938,17 +10005,31 @@ def test_voice_page_size_500_hydrates_content_in_bounded_batches() -> None:
     ] == [200, 200, 100]
 
 
+def _voice_root_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Synthetic voice wire row with the complete CH25 replay metadata."""
+    return complete_root_row(
+        {
+            "root_span_id": row.get("root_span_id") or row.get("span_id"),
+            "_root_observation_type": "conversation",
+            **row,
+        },
+        project_id=PROJECT_ID,
+    )
+
+
 def _voice_hydration_rows(count: int) -> list[dict[str, Any]]:
     return [
-        {
-            "project_id": PROJECT_ID,
-            "trace_id": f"trace-{index:03d}",
-            "root_span_id": f"root-{index:03d}",
-            "span_id": f"root-{index:03d}",
-            "start_time": END - timedelta(microseconds=index + 1),
-            "end_time": END - timedelta(microseconds=index),
-            "provider": "vapi",
-        }
+        _voice_root_row(
+            {
+                "project_id": PROJECT_ID,
+                "trace_id": f"trace-{index:03d}",
+                "root_span_id": f"root-{index:03d}",
+                "span_id": f"root-{index:03d}",
+                "start_time": END - timedelta(microseconds=index + 1),
+                "end_time": END - timedelta(microseconds=index),
+                "provider": "vapi",
+            }
+        )
         for index in range(count)
     ]
 
@@ -10029,13 +10110,130 @@ def test_voice_content_hydration_rejects_mixed_missing_root_identity() -> None:
     process_raw_logs.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "_root_observation_type",
+        "_root_service_name",
+        "_root_start_hour",
+        "_root_version",
+    ],
+)
+def test_voice_content_hydration_requires_selected_physical_metadata(
+    missing_field: str,
+) -> None:
+    page_rows = _voice_hydration_rows(2)
+    page_rows[1].pop(missing_field)
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows,
+        AssertionError("hydration must not run with incomplete physical metadata"),
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    analytics.execute_ch_query.assert_not_called()
+    process_raw_logs.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("_root_observation_type", "SPAN"),
+        ("_root_service_name", "other-service"),
+        ("_root_start_hour", END),
+        ("_root_version", 2),
+        ("_root_version", None),
+        ("_root_service_name", None),
+    ],
+)
+def test_voice_content_hydration_rejects_physical_or_version_drift(
+    field: str, replacement: Any
+) -> None:
+    page_rows = _voice_hydration_rows(2)
+
+    def hydrate(_query, params, **_kwargs):
+        assert all(len(identity) == 8 for identity in params["content_root_identities"])
+        returned = [{**row, "span_attributes": "{}"} for row in reversed(page_rows)]
+        returned[0][field] = replacement
+        return QueryResult(
+            data=returned,
+            row_count=len(returned),
+            backend_used="clickhouse",
+            query_time_ms=1.0,
+        )
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows, hydrate
+    )
+
+    assert response[0] == "error"
+    assert response[1][0] == 503
+    analytics.execute_ch_query.assert_called_once()
+    process_raw_logs.assert_not_called()
+
+
+def test_voice_content_hydration_keeps_attribute_association_after_reordering() -> None:
+    page_rows = _voice_hydration_rows(2)
+    page_rows[0]["_root_service_name"] = "service-a"
+    page_rows[0]["_root_version"] = 5
+    page_rows[1]["_root_service_name"] = "service-b"
+    page_rows[1]["_root_version"] = 9
+
+    def hydrate(_query, params, **_kwargs):
+        assert [identity[5:] for identity in params["content_root_identities"]] == [
+            (
+                row["_root_service_name"],
+                int(row["_root_start_hour"].timestamp()) * 1_000_000,
+                row["_root_version"],
+            )
+            for row in page_rows
+        ]
+        returned = [
+            {
+                **row,
+                "span_attributes": "{}",
+                "attrs_string": {"marker": row["_root_service_name"]},
+                "attrs_number": {"fixture_version": row["_root_version"]},
+                "attrs_bool": {"fixture_enabled": True},
+            }
+            for row in reversed(page_rows)
+        ]
+        return QueryResult(
+            data=returned,
+            row_count=len(returned),
+            backend_used="clickhouse",
+            query_time_ms=1.0,
+        )
+
+    response, analytics, process_raw_logs = _run_voice_hydration_case(
+        page_rows, hydrate
+    )
+
+    assert response.status_code == 200
+    assert [row["trace_id"] for row in response.data["results"]] == [
+        row["trace_id"] for row in page_rows
+    ]
+    assert [row["marker"] for row in response.data["results"]] == [
+        "service-a",
+        "service-b",
+    ]
+    assert [row["fixture_version"] for row in response.data["results"]] == [5, 9]
+    assert all(row["fixture_enabled"] is True for row in response.data["results"])
+    assert not any(
+        key.startswith("_root_") for row in response.data["results"] for key in row
+    )
+    analytics.execute_ch_query.assert_called_once()
+    assert process_raw_logs.call_count == 2
+
+
 def test_voice_content_hydration_recursively_splits_only_code241_exactly() -> None:
     page_rows = _voice_hydration_rows(6)
     row_by_span_id = {row["span_id"]: row for row in page_rows}
     attempted_batch_sizes = []
 
     def hydrate(_query, params, **kwargs):
-        span_ids = list(params["content_span_ids"])
+        span_ids = [identity[2] for identity in params["content_root_identities"]]
         attempted_batch_sizes.append(len(span_ids))
         assert kwargs["settings"]["max_block_size"] == 8_192
         assert "preferred_max_column_in_block_size_bytes" not in kwargs["settings"]
@@ -10044,17 +10242,19 @@ def test_voice_content_hydration_recursively_splits_only_code241_exactly() -> No
         selected = row_by_span_id[span_ids[0]]
         return QueryResult(
             data=[
-                {
-                    "project_id": PROJECT_ID,
-                    "trace_id": selected["trace_id"],
-                    "span_id": selected["span_id"],
-                    "start_time": selected["start_time"],
-                    "span_attributes": f'{{"marker":"{selected["span_id"]}"}}',
-                    "attrs_string": {},
-                    "attrs_number": {},
-                    "attrs_bool": {},
-                    "provider": "vapi",
-                }
+                _voice_root_row(
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": selected["trace_id"],
+                        "span_id": selected["span_id"],
+                        "start_time": selected["start_time"],
+                        "span_attributes": f'{{"marker":"{selected["span_id"]}"}}',
+                        "attrs_string": {},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                        "provider": "vapi",
+                    }
+                )
             ],
             row_count=1,
             backend_used="clickhouse",
@@ -10100,17 +10300,19 @@ def test_voice_content_hydration_rejects_equal_count_identity_mismatch(
             ]
         return QueryResult(
             data=[
-                {
-                    "project_id": row["project_id"],
-                    "trace_id": row["trace_id"],
-                    "span_id": row["span_id"],
-                    "start_time": row["start_time"],
-                    "span_attributes": "{}",
-                    "attrs_string": {},
-                    "attrs_number": {},
-                    "attrs_bool": {},
-                    "provider": "vapi",
-                }
+                _voice_root_row(
+                    {
+                        "project_id": row["project_id"],
+                        "trace_id": row["trace_id"],
+                        "span_id": row["span_id"],
+                        "start_time": row["start_time"],
+                        "span_attributes": "{}",
+                        "attrs_string": {},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                        "provider": "vapi",
+                    }
+                )
                 for row in returned
             ],
             row_count=2,
@@ -10133,7 +10335,9 @@ def test_voice_content_hydration_does_not_split_a_later_timeout() -> None:
     attempted_batch_sizes = []
 
     def hydrate(_query, params, **_kwargs):
-        attempted_batch_sizes.append(len(params["content_span_ids"]))
+        attempted_batch_sizes.append(
+            len([identity[2] for identity in params["content_root_identities"]])
+        )
         if len(attempted_batch_sizes) == 1:
             raise ReadDeadlineExceeded("Code: 241. Memory limit exceeded")
         raise ReadDeadlineExceeded("read deadline exceeded")
@@ -10154,23 +10358,25 @@ def test_voice_content_hydration_attempt_cap_is_atomic() -> None:
     row_by_span_id = {row["span_id"]: row for row in page_rows}
 
     def hydrate(_query, params, **_kwargs):
-        span_ids = list(params["content_span_ids"])
+        span_ids = [identity[2] for identity in params["content_root_identities"]]
         if len(span_ids) > 1:
             raise ReadDeadlineExceeded("Code: 241. Memory limit exceeded")
         selected = row_by_span_id[span_ids[0]]
         return QueryResult(
             data=[
-                {
-                    "project_id": PROJECT_ID,
-                    "trace_id": selected["trace_id"],
-                    "span_id": selected["span_id"],
-                    "start_time": selected["start_time"],
-                    "span_attributes": "{}",
-                    "attrs_string": {},
-                    "attrs_number": {},
-                    "attrs_bool": {},
-                    "provider": "vapi",
-                }
+                _voice_root_row(
+                    {
+                        "project_id": PROJECT_ID,
+                        "trace_id": selected["trace_id"],
+                        "span_id": selected["span_id"],
+                        "start_time": selected["start_time"],
+                        "span_attributes": "{}",
+                        "attrs_string": {},
+                        "attrs_number": {},
+                        "attrs_bool": {},
+                        "provider": "vapi",
+                    }
+                )
             ],
             row_count=1,
             backend_used="clickhouse",
@@ -10188,14 +10394,19 @@ def test_voice_content_hydration_attempt_cap_is_atomic() -> None:
 
 
 def test_voice_content_identity_normalizes_naive_and_aware_utc() -> None:
-    from tracer.views.trace import _voice_content_identity
+    naive = _voice_hydration_rows(1)[0]
+    naive["_root_start_hour"] = naive["_root_start_hour"].replace(tzinfo=None)
+    aware = {
+        **naive,
+        "start_time": naive["start_time"].replace(tzinfo=UTC),
+        "_root_start_hour": naive["_root_start_hour"].replace(tzinfo=UTC),
+    }
+    builder = VoiceCallListQueryBuilderV2(project_id=PROJECT_ID)
+    identity = builder.bounded_filter_page_hydration_identity(naive)
 
-    naive = datetime(2026, 6, 7, 12, 34, 56, 789012)
-    aware = naive.replace(tzinfo=UTC)
-
-    assert _voice_content_identity(PROJECT_ID, "trace", "span", naive) == (
-        _voice_content_identity(PROJECT_ID, "trace", "span", aware)
-    )
+    assert identity is not None
+    assert len(identity) == 8
+    assert identity == builder.bounded_filter_page_hydration_identity(aware)
 
 
 def test_voice_content_hydration_budget_failure_is_atomic_and_sanitized() -> None:
@@ -10204,15 +10415,17 @@ def test_voice_content_hydration_budget_failure_is_atomic_and_sanitized() -> Non
     started = END - timedelta(minutes=1)
     bounded_page = BoundedFilterPage(
         rows=[
-            {
-                "project_id": PROJECT_ID,
-                "trace_id": "trace-a",
-                "root_span_id": "root-a",
-                "span_id": "root-a",
-                "start_time": started,
-                "end_time": started + timedelta(seconds=12),
-                "provider": "vapi",
-            }
+            _voice_root_row(
+                {
+                    "project_id": PROJECT_ID,
+                    "trace_id": "trace-a",
+                    "root_span_id": "root-a",
+                    "span_id": "root-a",
+                    "start_time": started,
+                    "end_time": started + timedelta(seconds=12),
+                    "provider": "vapi",
+                }
+            )
         ],
         has_more=True,
         complete=True,

@@ -542,11 +542,7 @@ def test_actual_org_duplicate_trace_ids_replay_only_their_own_roots(engine):
 
 
 @pytest.mark.parametrize("cls", [TraceListQueryBuilder])
-def test_legacy_and_voice_delegate_keep_four_part_contract(cls):
-    from tracer.services.clickhouse.v2.query_builders.voice_call_list import (
-        VoiceCallListQueryBuilderV2,
-    )
-
+def test_legacy_keeps_four_part_contract(cls):
     builder = make_builder(cls)
     row = root_row()
     expected = (
@@ -559,10 +555,6 @@ def test_legacy_and_voice_delegate_keep_four_part_contract(cls):
     sql, _ = builder.build_filter_page_hydration_query([row])
     assert "GROUP BY project_id, trace_id, id, start_time" in sql
     assert "_root_service_name" not in sql
-    voice = VoiceCallListQueryBuilderV2(project_id=PROJECT)
-    assert voice.bounded_filter_page_hydration_identity(row) == expected
-    voice_sql, _ = voice.build_filter_page_hydration_query([row])
-    assert "GROUP BY project_id, trace_id, id, start_time" in voice_sql
 
 
 class InlineAnalytics:

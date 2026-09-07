@@ -61,9 +61,12 @@ vi.mock("./useExactEvalAttributeFields", async (importOriginal) => ({
   }),
 }));
 
-vi.mock("src/sections/tasks/components/TaskLivePreview", () => ({
-  buildApiFilterArray: () => [],
-}));
+vi.mock(
+  "src/sections/tasks/components/TaskLivePreview",
+  async (importOriginal) => ({
+    buildApiFilterArray: (await importOriginal()).buildApiFilterArray,
+  }),
+);
 vi.mock("src/sections/tasks/components/TaskFilterBar", () => ({
   default: () => null,
 }));
@@ -472,7 +475,9 @@ describe("TracingTestMode exact task attribute mapping", () => {
       expect(oldSignal.aborted).toBe(true);
       expect(screen.getAllByRole("progressbar")[0]).toBeVisible();
       expect(screen.getByPlaceholderText("Loading columns...")).toBeDisabled();
-      expect(screen.queryByText("No span data found")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("No matching spans found"),
+      ).not.toBeInTheDocument();
       expect(
         screen.queryByText(QUERY_FAILED_RETRY_MESSAGE),
       ).not.toBeInTheDocument();
@@ -588,6 +593,98 @@ describe("TracingTestMode exact task attribute mapping", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("(100 matching total)")).not.toBeInTheDocument();
   });
+
+  it.each([
+    ["spans", "/spans/"],
+    ["traces", "/traces/"],
+    ["sessions", "/sessions/"],
+    ["voiceCalls", "/calls/"],
+  ])(
+    "sends the visible preview range for %s and resets it on 12M selection",
+    async (rowType, endpoint) => {
+      mocks.get.mockImplementation(async (url) => {
+        if (url === `/projects/${PROJECT_ID}`) {
+          return {
+            data: {
+              result: {
+                id: PROJECT_ID,
+                source: rowType === "voiceCalls" ? "simulator" : "api",
+              },
+            },
+          };
+        }
+        if (url === endpoint) {
+          if (rowType === "voiceCalls")
+            return {
+              data: {
+                count: 0,
+                count_is_lower_bound: false,
+                query_complete: true,
+                query_status: "complete",
+                total_pages: 0,
+                current_page: 1,
+                next: null,
+                previous: null,
+                results: [],
+                config: [],
+                has_more: false,
+                next_cursor: null,
+              },
+            };
+          return {
+            data: {
+              status: true,
+              result: {
+                config: [],
+                table: [],
+                metadata: {
+                  total_rows: 0,
+                  has_more: false,
+                  next_cursor: null,
+                },
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected GET ${url}`);
+      });
+      const view = renderTaskMapping(vi.fn(), {
+        initialRowType: rowType,
+        hostsFilter: true,
+        variables: [],
+      });
+      await screen.findByText(/No matching .* found/);
+      expect(
+        screen.getByText("Try changing the filters or date range."),
+      ).toBeVisible();
+      const calls = () =>
+        mocks.get.mock.calls.filter(([url]) => url === endpoint);
+      const first = calls().at(-1)[1].params;
+      const initial = JSON.parse(first.filters).find(
+        (f) => f.column_id === "created_at",
+      );
+      expect(initial.filter_config.filter_op).toBe("between");
+      const initialStart = new Date(initial.filter_config.filter_value[0]);
+      expect((Date.now() - initialStart.getTime()) / 86400000).toBeCloseTo(
+        30,
+        1,
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Past 30D" }));
+      await userEvent.click(screen.getByRole("menuitem", { name: "Past 12M" }));
+      await waitFor(() => {
+        const latest = JSON.parse(calls().at(-1)[1].params.filters).find(
+          (f) => f.column_id === "created_at",
+        );
+        expect(
+          new Date(latest.filter_config.filter_value[0]).getTime(),
+        ).toBeLessThan(initialStart.getTime() - 300 * 86400000);
+      });
+      expect(screen.getByRole("button", { name: "Past 12M" })).toBeVisible();
+      expect(calls().at(-1)[1].params).not.toHaveProperty("cursor");
+      expect(mocks.post).not.toHaveBeenCalled();
+      view.unmount();
+    },
+  );
 
   it("keeps an arbitrary exact path as a manual free-text mapping", async () => {
     mocks.exactFields = [];
