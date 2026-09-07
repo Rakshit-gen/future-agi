@@ -74,6 +74,7 @@ from tracer.serializers.trace import (
     TraceExportQuerySerializer,
     TraceIndexQuerySerializer,
     TraceListQuerySerializer,
+    TraceNavigationResponseSerializer,
     TraceObserveIndexQuerySerializer,
     TraceObserveListQuerySerializer,
     TraceObserveListResponseSerializer,
@@ -2655,6 +2656,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         unavailable_message="Trace data is temporarily unavailable. Please retry.",
     )
     @validated_request(
+        read_post=True,
         query_serializer=TraceListQuerySerializer,
         responses={
             200: TracePrototypeListResponseSerializer,
@@ -2664,7 +2666,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             503: ApiErrorResponseSerializer,
         },
     )
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["get", "post"])
     def list_traces(self, request, *args, **kwargs):
         """
         List traces filtered by project ID and project version ID with optimized queries.
@@ -3267,8 +3269,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 f"Error comparing traces: {get_error_message('ERROR_COMPARING_TRACES')}"
             )
 
-    @validated_request(query_serializer=TraceIndexQuerySerializer)
-    @action(detail=False, methods=["get"])
+    @validated_request(
+        read_post=True,
+        query_serializer=TraceIndexQuerySerializer,
+        responses={200: TraceNavigationResponseSerializer},
+    )
+    @action(detail=False, methods=["get", "post"])
     def get_trace_id_by_index(self, request, *args, **kwargs):
         """
         Get the previous and next trace id by index using efficient database queries.
@@ -3555,6 +3561,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         unavailable_message="Trace data is temporarily unavailable. Please retry.",
     )
     @validated_request(
+        read_post=True,
         query_serializer=TraceObserveListQuerySerializer,
         responses={
             200: TraceObserveListResponseSerializer,
@@ -3563,7 +3570,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             503: ApiErrorResponseSerializer,
         },
     )
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["get", "post"])
     def list_traces_of_session(self, request, *args, **kwargs):
         """
         List traces filtered by project ID with optimized queries.
@@ -3689,6 +3696,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         ),
     )
     @validated_request(
+        read_post=True,
         query_serializer=TraceVoiceCallListQuerySerializer,
         responses={
             200: TraceVoiceCallListResponseSerializer,
@@ -3699,7 +3707,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             503: ApiErrorResponseSerializer,
         },
     )
-    @action(detail=False, methods=["get"], pagination_class=None)
+    @action(detail=False, methods=["get", "post"], pagination_class=None)
     def list_voice_calls(self, request, *args, **kwargs):
         """
         List voice/conversation traces for a project in an optimized way and
@@ -4271,8 +4279,12 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         }
         return self._gm.success_response(response)
 
-    @validated_request(query_serializer=TraceObserveIndexQuerySerializer)
-    @action(detail=False, methods=["get"])
+    @validated_request(
+        read_post=True,
+        query_serializer=TraceObserveIndexQuerySerializer,
+        responses={200: TraceNavigationResponseSerializer},
+    )
+    @action(detail=False, methods=["get", "post"])
     def get_trace_id_by_index_observe(self, request, *args, **kwargs):
         """
         Get the previous and next trace id by index.
@@ -4502,6 +4514,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         ]
         cursor_scope = cursor_scope_for_request(request, project_ids=scope_project_ids)
         cursor_query = dict(validated_data)
+        cursor_query["trace_root_contract"] = "physical-root-winner-v1"
         cursor_state = None
         cursor_order_token = None
         if cursor_token:
@@ -4651,7 +4664,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Long-window trace filter is not cursor-safe"
             )
         if not cursor_requested and requires_cursor:
-            if "cursor_mode" in request.query_params:
+            if "cursor_mode" in getattr(
+                getattr(request, "validated_query_serializer", None),
+                "initial_data",
+                request.query_params,
+            ):
                 return self._gm.custom_error_response(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     CURSOR_REQUIRED_MESSAGE,
@@ -4737,6 +4754,26 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 ),
                 bounded_continuation=cursor_enabled,
                 carry_continuation_slice_width=cursor_enabled,
+                # Only project-scoped CH25 Observe trace cursors opt in. Keep
+                # org-user direct seeds, numbered/exact-total and session-detail
+                # reads unchanged; never replace an unfinished keyset.
+                root_time_discovery=bool(
+                    cursor_enabled
+                    and page_number == 0
+                    and not org_scope
+                    and not session_id
+                    and not validated_data.get("require_exact_total", False)
+                    and not exact_total_explicitly_required(request, validated_data)
+                    and (
+                        cursor_state is None
+                        or (
+                            cursor_state.scan_slice_end is not None
+                            and cursor_state.scan_before_start_time is None
+                            and cursor_state.scan_before_id is None
+                        )
+                    )
+                    and builder.supports_filter_root_time_discovery()
+                ),
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
@@ -4968,27 +5005,21 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     if (row.get("project_id") or project_id) and row.get("trace_id")
                 )
             )
-            chunk_root_identities = [
-                (
-                    str(row.get("project_id") or project_id or ""),
-                    str(row.get("trace_id") or ""),
-                    str(row.get("root_span_id") or ""),
-                    row.get("start_time"),
+            try:
+                content_query, content_params = builder.build_content_query(
+                    chunk_trace_ids,
+                    root_identities=builder.content_root_identities_for_rows(
+                        chunk_rows
+                    ),
                 )
-                for row in chunk_rows
-                if row.get("trace_id")
-                and row.get("root_span_id")
-                and row.get("start_time") is not None
-                and (row.get("project_id") or project_id)
-            ]
-            content_query, content_params = builder.build_content_query(
-                chunk_trace_ids,
-                root_identities=(
-                    chunk_root_identities
-                    if len(chunk_root_identities) == len(chunk_rows)
-                    else None
-                ),
-            )
+            except ValueError:
+                # Never publish a cursor checkpoint for roots that cannot be
+                # replayed. Retrying the input cursor revisits these matches.
+                return self._gm.custom_error_response(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Trace data is temporarily unavailable. Please retry.",
+                    code="service_unavailable",
+                )
             if content_query:
                 task_name = f"content:{chunk_index}"
                 tasks[task_name] = (content_query, content_params)
@@ -5136,6 +5167,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             len(expected_content_identities) != len(result.data)
             or len(actual_content_identities) != len(expected_content_identities)
             or set(actual_content_identities) != set(expected_content_identities)
+            or not builder.content_root_rows_match(result.data, content_rows)
         ):
             logger.warning(
                 "trace_list_content_replay_incomplete",
@@ -5740,7 +5772,11 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 "Long-window voice-call filter is not cursor-safe"
             )
         if not cursor_requested and requires_cursor:
-            if "cursor_mode" in request.query_params:
+            if "cursor_mode" in getattr(
+                getattr(request, "validated_query_serializer", None),
+                "initial_data",
+                request.query_params,
+            ):
                 return self._gm.custom_error_response(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     CURSOR_REQUIRED_MESSAGE,
@@ -6696,25 +6732,17 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         bounded_user_resolver = getattr(
             builder, "resolve_user_ids_for_trace_identities", None
         )
-        root_identities = [
-            (
-                str(row.get("project_id") or project_id or ""),
-                str(row.get("trace_id") or ""),
-                str(row.get("root_span_id") or ""),
-                row.get("start_time"),
+        try:
+            content_query, content_params = builder.build_content_query(
+                trace_ids,
+                root_identities=builder.content_root_identities_for_rows(result.data),
             )
-            for row in result.data
-            if row.get("trace_id")
-            and row.get("root_span_id")
-            and row.get("start_time") is not None
-            and (row.get("project_id") or project_id)
-        ]
-        content_query, content_params = builder.build_content_query(
-            trace_ids,
-            root_identities=(
-                root_identities if len(root_identities) == len(result.data) else None
-            ),
-        )
+        except ValueError:
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         eval_query, eval_params = builder.build_eval_query(trace_ids)
         if callable(bounded_user_resolver):
             user_query, user_params = "", {}
@@ -6817,6 +6845,14 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         content_rows = content_result.data if content_result is not None else []
         for content_row in content_rows:
             content_row.setdefault("project_id", str(project_id))
+        if content_query and not builder.content_root_rows_match(
+            result.data, content_rows
+        ):
+            return self._gm.custom_error_response(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Trace data is temporarily unavailable. Please retry.",
+                code="service_unavailable",
+            )
         merge_content_rows(
             result.data,
             content_rows,
@@ -6979,6 +7015,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
     # ------------------------------------------------------------------
 
     @validated_request(
+        read_post=True,
         query_serializer=TraceAgentGraphQuerySerializer,
         responses={
             200: TraceAgentGraphResponseSerializer,
@@ -6987,7 +7024,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
             503: ApiErrorResponseSerializer,
         },
     )
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["get", "post"])
     def agent_graph(self, request, *args, **kwargs):
         """Return one cached exact Agent Graph.
 
@@ -7057,11 +7094,16 @@ class UsersView(APIView):
     def _requested_columns_for_request(request, query_data):
         """Restore the omitted-vs-explicit-empty distinction after validation."""
 
-        if "requested_columns" not in request.query_params:
+        if "requested_columns" not in getattr(
+            getattr(request, "validated_query_serializer", None),
+            "initial_data",
+            request.query_params,
+        ):
             return None
         return query_data.get("requested_columns", [])
 
     @validated_request(
+        read_post=True,
         query_serializer=UsersQuerySerializer,
         responses={
             200: UsersResponseSerializer,
@@ -7229,6 +7271,8 @@ class UsersView(APIView):
                 "User data could not be loaded",
                 code="server_error",
             )
+
+    post = get
 
 
 class GetUserCodeExampleView(APIView):

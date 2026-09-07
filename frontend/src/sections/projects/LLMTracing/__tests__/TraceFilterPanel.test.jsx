@@ -3016,7 +3016,7 @@ describe("exact manual attribute fallback", () => {
     });
 
     const { anchorEl } = renderPanel({
-      projectId: "project-whatfix",
+      projectId: "project-tertiary-fixture",
       source: "traces",
     });
 
@@ -3027,7 +3027,7 @@ describe("exact manual attribute fallback", () => {
           params: expect.objectContaining({
             page: 1,
             page_size: 200,
-            project_ids: "project-whatfix",
+            project_ids: "project-tertiary-fixture",
             per_eval_config: true,
             exclude_custom_attributes: true,
           }),
@@ -3044,7 +3044,7 @@ describe("exact manual attribute fallback", () => {
     ).toBeInTheDocument();
     expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        projectId: "project-whatfix",
+        projectId: "project-tertiary-fixture",
         search: "",
         source: "traces",
         enabled: true,
@@ -3124,7 +3124,7 @@ describe("exact manual attribute fallback", () => {
     };
     const { anchorEl } = renderPanel({
       properties: [finalStatus],
-      projectId: "project-voice-whatfix",
+      projectId: "project-voice-tertiary-fixture",
       source: "traces",
       tab: "voiceCalls",
       currentFilters: [
@@ -3142,7 +3142,7 @@ describe("exact manual attribute fallback", () => {
 
     expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        projectId: "project-voice-whatfix",
+        projectId: "project-voice-tertiary-fixture",
         source: "spans",
       }),
     );
@@ -3350,7 +3350,7 @@ describe("exact manual attribute fallback", () => {
     });
     const { anchorEl, rerenderPanel } = renderPanel({
       properties: [],
-      projectId: "project-coletia",
+      projectId: "project-observe",
       source: "traces",
     });
 
@@ -3468,7 +3468,7 @@ describe("exact manual attribute fallback", () => {
     });
     const { anchorEl } = renderPanel({
       properties: [],
-      projectId: "project-coletia",
+      projectId: "project-observe",
       source: "traces",
     });
 
@@ -3702,7 +3702,7 @@ describe("exact manual attribute fallback", () => {
     });
     const { anchorEl } = renderPanel({
       properties: [],
-      projectId: "project-whatfix",
+      projectId: "project-tertiary-fixture",
       source: "traces",
     });
 
@@ -3830,7 +3830,7 @@ describe("exact manual attribute fallback", () => {
     });
 
     const { anchorEl } = renderPanel({
-      projectId: "project-whatfix",
+      projectId: "project-tertiary-fixture",
       source: "traces",
     });
 
@@ -3843,7 +3843,7 @@ describe("exact manual attribute fallback", () => {
           params: expect.objectContaining({
             category: "custom_attribute",
             source: "traces",
-            project_ids: "project-whatfix",
+            project_ids: "project-tertiary-fixture",
             per_eval_config: true,
             page: 1,
             page_size: 20,
@@ -3865,7 +3865,7 @@ describe("exact manual attribute fallback", () => {
           params: expect.objectContaining({
             category: "custom_attribute",
             source: "traces",
-            project_ids: "project-whatfix",
+            project_ids: "project-tertiary-fixture",
             per_eval_config: true,
             page: 2,
             page_size: 20,
@@ -3905,7 +3905,7 @@ describe("exact manual attribute fallback", () => {
     });
 
     const { anchorEl } = renderPanel({
-      projectId: "project-whatfix",
+      projectId: "project-tertiary-fixture",
       source: "traces",
     });
     fireEvent.click(screen.getByRole("button", { name: "Property" }));
@@ -4100,7 +4100,7 @@ describe("filter-value picker bounded-read UX", () => {
         },
       ],
       properties: [promptSlugProperty],
-      projectId: "project-coletia",
+      projectId: "project-observe",
       source: "traces",
     });
 
@@ -5209,7 +5209,7 @@ describe("filter-value picker bounded-read UX", () => {
     const onApply = vi.fn();
     const { anchorEl } = renderPanel({
       properties: [],
-      projectId: "project-coletia",
+      projectId: "project-observe",
       source: "traces",
       onApply,
       showQueryTab: true,
@@ -5232,7 +5232,7 @@ describe("filter-value picker bounded-read UX", () => {
 
     expect(exactAttributePropertiesMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        projectId: "project-coletia",
+        projectId: "project-observe",
         search: "final_status",
         source: "traces",
         enabled: true,
@@ -5521,7 +5521,7 @@ describe("filter-value picker bounded-read UX", () => {
           apiColType: "SYSTEM_METRIC",
         },
       ],
-      projectId: "project-mudflap",
+      projectId: "project-secondary-fixture",
       source: "traces",
       tab: "voiceCalls",
       showQueryTab: true,
@@ -5905,7 +5905,7 @@ describe("filter-value picker bounded-read UX", () => {
     });
     const { anchorEl } = renderPanel({
       properties: [],
-      projectId: "project-coletia",
+      projectId: "project-observe",
       source: "traces",
       showQueryTab: true,
     });
@@ -5956,7 +5956,7 @@ describe("filter-value picker bounded-read UX", () => {
     }));
     const { anchorEl } = renderPanel({
       properties: [],
-      projectId: "project-whatfix",
+      projectId: "project-tertiary-fixture",
       source: "traces",
       showQueryTab: true,
     });
@@ -6331,6 +6331,37 @@ describe("toStaticFilterProperty (spans Span Name)", () => {
 });
 
 describe("normalizeFilterRowOperator", () => {
+  it.each(["trace_id", "span_id", "session"])("mounted raw numeric %s keeps greater_than after edit", async (field) => {
+    const row = { field, fieldName: field, registryId: `custom_attribute:${field}`, apiColType: "SPAN_ATTRIBUTE", fieldCategory: "attribute", fieldType: "number", operator: "greater_than", value: 2 };
+    const { anchorEl, onApply } = renderPanel({
+      currentFilters: [row],
+      properties: [{ id: field, name: field, registryId: row.registryId, category: "attribute", type: "number", apiColType: "SPAN_ATTRIBUTE" }],
+    });
+    try {
+      fireEvent.change(screen.getByPlaceholderText("Value"), { target: { value: "3" } });
+      await waitFor(() => expect(onApply).toHaveBeenCalled());
+      expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])).toEqual(buildApiFilterFromPanelRow({ ...row, value: 3 }));
+    } finally { anchorEl.remove(); }
+  });
+
+  it.each(["trace_id", "span_id", "session"])("mounted legacy native %s keeps negative membership after edit", async (field) => {
+    const { anchorEl, onApply } = renderPanel({
+      currentFilters: [{ field, fieldName: field, fieldType: "string", operator: "not_in", value: ["native-a"] }],
+      properties: [{ id: field, name: field, category: "system", type: "string", apiColType: "SYSTEM_METRIC", choices: ["native-a", "native-b"] }],
+    });
+    try {
+      fireEvent.click(document.querySelector(`[data-filter-value-trigger="${field}"]`));
+      fireEvent.click(await screen.findByText("native-b"));
+      await waitFor(() => expect(onApply).toHaveBeenCalled());
+      expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]).filter_config).toEqual({ col_type: "SYSTEM_METRIC", filter_type: "text", filter_op: "not_in", filter_value: ["native-a", "native-b"] });
+    } finally { anchorEl.remove(); }
+  });
+
+  it.each(["trace_id", "span_id", "session"])("source audit: raw %s keeps its declared type operators", (field) => {
+    const row = { field, apiColType: "SPAN_ATTRIBUTE", fieldCategory: "attribute", fieldType: "number", operator: "greater_than", value: 2 };
+    expect(buildApiFilterFromPanelRow(normalizeFilterRowOperator(row))).toEqual(buildApiFilterFromPanelRow(row));
+  });
+
   it("maps list operators to canonical equality panel operators before apply", () => {
     expect(
       normalizeFilterRowOperator({

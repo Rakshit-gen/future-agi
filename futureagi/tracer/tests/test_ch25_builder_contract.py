@@ -45,6 +45,8 @@ from datetime import timedelta
 
 import pytest
 
+from tracer.tests.test_trace_root_physical_replay import complete_root_row
+
 # v1-only tokens that must never survive the rewrite in v2 builder output. Scope:
 # dict + column names (the renames this boundary owns). Table names with no 1:1
 # v2 equivalent (tracer_eval_logger / model_hub_score) are intentionally out of
@@ -241,6 +243,19 @@ class TestListBuilderOutputContract:
                 continue
             method = getattr(builder, name)
             if name in {
+                "build_filter_root_time_discovery_query",
+                "build_filter_population_time_discovery_query",
+            }:
+                original_internal = builder._bounded_internal_scan
+                builder._bounded_internal_scan = False
+                try:
+                    start, end = builder.parse_time_range(builder.filters)
+                    result = method(
+                        slice_start=max(start, end - timedelta(days=1)), slice_end=end
+                    )
+                finally:
+                    builder._bounded_internal_scan = original_internal
+            elif name in {
                 "build_filter_anchor_probe",
                 "build_filter_graph_key_witness_probe",
             }:
@@ -276,6 +291,28 @@ class TestListBuilderOutputContract:
             }:
                 start, end = builder.parse_time_range(builder.filters)
                 result = method(slice_start=start, slice_end=end, limit=2)
+            elif name == "build_filter_windowed_candidate_seed_page":
+                original_filters = builder.filters
+                original_internal = builder._bounded_internal_scan
+                builder.filters = [
+                    *original_filters,
+                    {
+                        "column_id": "contract.numeric",
+                        "filter_config": {
+                            "col_type": "SPAN_ATTRIBUTE",
+                            "filter_type": "number",
+                            "filter_op": "equals",
+                            "filter_value": 2,
+                        },
+                    },
+                ]
+                builder._bounded_internal_scan = False
+                try:
+                    start, end = builder.parse_time_range(builder.filters)
+                    result = method(slice_start=start, slice_end=end, limit=2)
+                finally:
+                    builder.filters = original_filters
+                    builder._bounded_internal_scan = original_internal
             elif name == "build_filter_candidate_seed_page":
                 if builder.supports_filter_candidate_seed_page():
                     start, end = builder.parse_time_range(builder.filters)
@@ -446,23 +483,45 @@ class TestListBuilderOutputContract:
                         }
                     ]
                 )
+            elif (
+                name == "build_content_query"
+                and type(builder).__name__ == "TraceListQueryBuilderV2"
+            ):
+                start, _ = builder.parse_time_range(builder.filters)
+                rows = [
+                    complete_root_row(
+                        {
+                            "project_id": "contract-test-proj",
+                            "trace_id": "dummy-trace-id",
+                            "root_span_id": "dummy-span-id",
+                            "start_time": start,
+                        }
+                    )
+                ]
+                result = method(
+                    ["dummy-trace-id"],
+                    root_identities=builder.content_root_identities_for_rows(rows),
+                )
             elif name in {
                 "build_filter_identity_match_query_from_seed_rows",
                 "build_filter_match_query_from_seed_rows",
                 "build_filter_page_hydration_query",
             }:
                 start, _ = builder.parse_time_range(builder.filters)
-                result = method(
-                    [
-                        {
-                            "project_id": "contract-test-proj",
-                            "trace_id": "dummy-trace-id",
-                            "id": "dummy-span-id",
-                            "root_span_id": "dummy-span-id",
-                            "start_time": start,
-                        }
-                    ]
-                )
+                rows = [
+                    {
+                        "project_id": "contract-test-proj",
+                        "trace_id": "dummy-trace-id",
+                        "id": "dummy-span-id",
+                        "root_span_id": "dummy-span-id",
+                        "observation_type": "SPAN",
+                        "service_name": "contract-service",
+                        "start_time": start,
+                    }
+                ]
+                if type(builder).__name__ == "TraceListQueryBuilderV2":
+                    rows = [complete_root_row(row) for row in rows]
+                result = method(rows)
             else:
                 sig = inspect.signature(method)
                 required = [

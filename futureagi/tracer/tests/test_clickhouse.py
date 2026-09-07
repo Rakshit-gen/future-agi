@@ -2066,10 +2066,11 @@ class TestClickHouseFilterBuilder:
             ]
         )
 
-        assert "arrayExists(x -> x ILIKE" in where
+        assert "arrayExists(x -> positionUTF8" in where
+        assert "arrayExists(x -> startsWith" in where
         assert "JSONExtract(output_str_list, 'Array(String)')" in where
-        assert "%fear%" in params.values()
-        assert "joy%" in params.values()
+        assert "fear" in params.values()
+        assert "joy" in params.values()
 
     def test_translate_annotation_filter(self):
         """ANNOTATION filter should produce a subquery against annotation tables."""
@@ -2182,8 +2183,9 @@ class TestClickHouseFilterBuilder:
         assert where.strip().startswith("tuple(trace_id, id) IN")
         assert "SELECT DISTINCT tuple(toString(if(" in where
         assert "scored_sp.id = s.observation_span_id" in where
-        assert "lower(JSONExtractString(s.value, 'text')) IN" in where
-        assert params["ann_2"] == ("good", "bad")
+        assert "has(arrayMap(x -> lowerUTF8(x), %(ann_" in where
+        assert "lowerUTF8(JSONExtractString(s.value, 'text'))" in where
+        assert params["ann_2"] == ["Good", "Bad"]
 
     def test_translate_skips_empty_filter_config(self):
         """Filters with missing column_id or config should be skipped."""
@@ -3679,30 +3681,34 @@ class TestSessionListQueryBuilder:
         query, params = builder.build_content_query(["session-1"])
 
         assert "trace_session_id IN %(content_session_ids)s" in query
-        assert (
-            query.count("toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC'))")
-            == 2
-        )
-        assert (
-            query.count("toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))") == 2
-        )
+        # Legacy start_time is a replacement-key column: precise acquisition
+        # is safe, but native exclusions still bind only after latest replay.
         assert (
             query.count(
-                "start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+                "AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
             )
             == 2
         )
         assert (
-            query.count("start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')")
-            == 2
+            "latest_start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            in query
         )
-        assert query.count("session_content_time_exclusion_0_start") == 2
-        assert query.count("session_content_time_exclusion_0_end") == 2
+        assert (
+            "latest_start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
+            in query
+        )
+        assert query.count("build_content_query_latest_time_0_start") == 1
+        assert query.count("build_content_query_latest_time_0_end") == 1
+        latest = query.split("latest_roots AS (", 1)[1].split("resolved_roots AS (", 1)[
+            0
+        ]
+        assert "build_content_query_latest_time_0_start" not in latest
+
         assert params["content_session_ids"] == ("session-1",)
         assert params["content_start_date"] == expected_start
         assert params["content_end_date"] == expected_end
-        assert "session_content_time_exclusion_0_start" in params
-        assert "session_content_time_exclusion_0_end" in params
+        assert "build_content_query_latest_time_0_start" in params
+        assert "build_content_query_latest_time_0_end" in params
 
     def test_span_attributes_query_reuses_session_time_window(self):
         from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
@@ -3740,22 +3746,39 @@ class TestSessionListQueryBuilder:
 
         query, params = builder.build_span_attributes_query(["session-1"])
 
-        assert "s.trace_session_id IN %(attr_session_ids)s" in query
-        assert "toDate(s.start_time) BETWEEN" in query
+        assert "trace_session_id IN %(attr_session_ids)s" in query
+        assert "candidate_root_identities AS (" in query
+        assert "latest_roots AS (" in query
+        assert "AS latest_start_time" in query
         assert (
-            "s.start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            "latest_start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
             in query
         )
         assert (
-            "s.start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')" in query
+            "latest_start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
+            in query
         )
-        assert "s.start_time < fromUnixTimestamp64Micro(" in query
-        assert "s.start_time >= fromUnixTimestamp64Micro(" in query
+        assert "latest_is_deleted = 0" in query
+        assert query.count("session_attr_latest_time_0_start") == 1
+        assert query.count("session_attr_latest_time_0_end") == 1
+        latest = query.split("latest_roots AS (", 1)[1].split("GROUP BY", 1)[0]
+        assert "session_attr_latest_time_0_start" not in latest
+        assert (
+            query.count(
+                "AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            )
+            == 2
+        )
+        assert "GROUP BY project_id, trace_id, id, start_time" in query
+        assert (
+            "argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted" in query
+        )
+
         assert params["attr_session_ids"] == ("session-1",)
         assert params["attr_start_date"] == expected_start
         assert params["attr_end_date"] == expected_end
-        assert "session_attr_time_exclusion_0_start" in params
-        assert "session_attr_time_exclusion_0_end" in params
+        assert "session_attr_latest_time_0_start" in params
+        assert "session_attr_latest_time_0_end" in params
 
     def test_v2_span_attributes_query_reuses_session_time_window(self):
         from tracer.services.clickhouse.v2.query_builders.session_list import (
@@ -3793,32 +3816,40 @@ class TestSessionListQueryBuilder:
         query, params = builder.build_span_attributes_query(["session-1"])
 
         assert "trace_session_id IN %(attr_session_ids)s" in query
+        assert "candidate_root_identities AS (" in query
+        assert "latest_roots AS (" in query
+        assert "AS latest_start_time" in query
         assert (
-            query.count("toDate(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC'))")
-            == 2
+            "latest_start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+            in query
         )
         assert (
-            query.count("toDate(fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC'))") == 2
+            "latest_start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
+            in query
         )
+        assert "latest_is_deleted = 0" in query
+        assert query.count("session_attr_latest_time_0_start") == 1
+        assert query.count("session_attr_latest_time_0_end") == 1
+        latest = query.split("latest_roots AS (", 1)[1].split("GROUP BY", 1)[0]
+        assert "session_attr_latest_time_0_start" not in latest
         assert (
             query.count(
-                "start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
+                "AND start_time >= toStartOfHour(fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC'))"
             )
             == 2
         )
+        assert "%(end_date_us)s - 1" in latest
         assert (
-            query.count("start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')")
-            == 2
+            "GROUP BY project_id, observation_type, service_name, toStartOfHour(start_time), trace_id, id"
+            in query
         )
-        assert query.count("session_attr_v2_time_exclusion_0_start") == 2
-        assert query.count("session_attr_v2_time_exclusion_0_end") == 2
         assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
-        assert "latest_is_deleted = 0" in query
+
         assert params["attr_session_ids"] == ("session-1",)
         assert params["attr_start_date"] == expected_start
         assert params["attr_end_date"] == expected_end
-        assert "session_attr_v2_time_exclusion_0_start" in params
-        assert "session_attr_v2_time_exclusion_0_end" in params
+        assert "session_attr_latest_time_0_start" in params
+        assert "session_attr_latest_time_0_end" in params
 
     def test_build_uses_uniqExact_for_deterministic_totals(self):
         """Session trace counts are exact; approximation is not publishable."""
@@ -3888,8 +3919,8 @@ class TestSessionListQueryBuilder:
         query, params = builder.build_span_attributes_query(["session-1", "session-2"])
         assert "(parent_span_id IS NULL OR parent_span_id = '')" in query
 
-    def test_span_attributes_query_has_limit(self):
-        """Span attributes query should have a LIMIT to prevent unbounded scans."""
+    def test_span_attributes_query_is_scoped_to_exact_page(self):
+        """Hydrate the selected sessions completely without sampling their roots."""
         from tracer.services.clickhouse.query_builders import SessionListQueryBuilder
 
         builder = SessionListQueryBuilder(
@@ -3900,7 +3931,9 @@ class TestSessionListQueryBuilder:
         )
         builder.build()
         query, params = builder.build_span_attributes_query(["session-1", "session-2"])
-        assert "LIMIT 500" in query
+        assert "IN %(attr_session_ids)s" in query
+        assert params["attr_session_ids"] == ("session-1", "session-2")
+        assert "LIMIT 500" not in query
 
     def test_span_attributes_query_empty_sessions(self):
         """Span attributes query should return empty for no sessions."""
@@ -6937,8 +6970,8 @@ class TestFilterBuilderEdgeCases:
         cases = [
             ("number", "equals", 45, ") = %(ann_", {45}),
             ("number", "between", [10, 50], " BETWEEN ", {10, 50}),
-            ("text", "equals", "good", ") = lower(%(ann_", {"good"}),
-            ("text", "not_equals", "bad", ") != lower(%(ann_", {"bad"}),
+            ("text", "equals", "good", ") = lowerUTF8(%(ann_", {"good"}),
+            ("text", "not_equals", "bad", ") != lowerUTF8(%(ann_", {"bad"}),
         ]
 
         for filter_type, filter_op, value, sql_fragment, expected_values in cases:
@@ -7063,8 +7096,8 @@ class TestFilterBuilderEdgeCases:
                     "filter_value": "needs",
                     "col_type": "ANNOTATION",
                 },
-                ["JSONExtractString", "'text'", "ILIKE"],
-                {"needs%"},
+                ["JSONExtractString", "'text'", "startsWith", "lowerUTF8"],
+                {"needs"},
             ),
             (
                 {
@@ -7093,7 +7126,7 @@ class TestFilterBuilderEdgeCases:
                     "filter_value": ["refund"],
                     "col_type": "ANNOTATION",
                 },
-                ["JSONExtract", "'selected'", "has(", "AND NOT ("],
+                ["JSONExtract", "'selected'", "has(", "AND (NOT ("],
                 {"refund"},
             ),
             (

@@ -25,6 +25,7 @@ from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryB
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
 )
+from tracer.tests.test_trace_root_physical_replay import root_row
 
 
 @pytest.fixture
@@ -138,24 +139,39 @@ class TestBuildContentQuery:
 
 @pytest.mark.unit
 class TestBuildContentQueryV2TraceTags:
+    @staticmethod
+    def _roots(project_ids, trace_ids):
+        rows = [
+            root_row(project_id=project, trace_id=trace, root_span_id=f"root-{trace}")
+            for project in project_ids
+            for trace in trace_ids
+        ]
+        return TraceListQueryBuilderV2(
+            project_ids=project_ids
+        ).content_root_identities_for_rows(rows)
+
     def test_reads_bounded_latest_trace_tags_without_dictionary(
         self, project_id, trace_ids
     ):
         query, params = TraceListQueryBuilderV2(
             project_id=project_id
-        ).build_content_query(trace_ids)
+        ).build_content_query(
+            trace_ids, root_identities=self._roots([project_id], trace_ids)
+        )
 
         assert "dictGet" not in query
         assert "trace_dict" not in query
         assert "FROM traces" in query
         assert "AND id IN %(content_trace_ids)s" in query
         assert params["content_trace_ids"] == tuple(trace_ids)
+        assert len(params["content_root_identities"]) == len(trace_ids)
+        assert all(len(identity) == 8 for identity in params["content_root_identities"])
 
     def test_collapses_latest_trace_version_and_discards_latest_tombstone(
         self, project_id, trace_ids
     ):
         query, _ = TraceListQueryBuilderV2(project_id=project_id).build_content_query(
-            trace_ids
+            trace_ids, root_identities=self._roots([project_id], trace_ids)
         )
 
         assert "argMax(tags, _version) AS latest_trace_tags" in query
@@ -166,7 +182,7 @@ class TestBuildContentQueryV2TraceTags:
 
     def test_joins_tags_on_project_and_trace_identity(self, project_id, trace_ids):
         query, _ = TraceListQueryBuilderV2(project_id=project_id).build_content_query(
-            trace_ids
+            trace_ids, root_identities=self._roots([project_id], trace_ids)
         )
 
         assert "PREWHERE project_id = %(project_id)s" in query
@@ -177,10 +193,15 @@ class TestBuildContentQueryV2TraceTags:
         project_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
         query, params = TraceListQueryBuilderV2(
             project_ids=project_ids
-        ).build_content_query(trace_ids)
+        ).build_content_query(
+            trace_ids, root_identities=self._roots(project_ids, trace_ids)
+        )
 
         assert query.count("project_id IN %(project_ids)s") == 2
         assert params["project_ids"] == tuple(project_ids)
+        assert {(root[0], root[1]) for root in params["content_root_identities"]} == {
+            (project, trace) for project in project_ids for trace in trace_ids
+        }
 
 
 # ---------------------------------------------------------------------------

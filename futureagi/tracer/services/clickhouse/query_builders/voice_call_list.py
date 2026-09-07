@@ -279,7 +279,9 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
 
         if self.supports_filter_candidate_seed_page():
             request_start, request_end = self._bounded_request_window
-            return request_end - request_start
+            width = request_end - request_start
+            # Sub-five-minute requests use the selector's clipped default.
+            return width if width >= timedelta(minutes=5) else None
         if not self.prefer_filter_candidate_witness_probe_first():
             return None
         return (
