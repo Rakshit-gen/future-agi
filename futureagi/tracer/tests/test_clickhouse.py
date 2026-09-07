@@ -7610,6 +7610,17 @@ class TestVoiceCallListPhase1bMigration:
     ``FINAL`` query would reintroduce the production timeout.
     """
 
+    _ROOT_IDENTITY = (
+        "00000000-0000-4000-8000-000000000001",
+        "trace-1",
+        "root-1",
+        1_785_369_600_123_456,  # 2026-07-30 00:00:00.123456 UTC
+        "conversation",
+        "svc",
+        1_785_369_600_000_000,  # Physical replacement key uses the start hour.
+        2,
+    )
+
     @staticmethod
     def _voice_list_source() -> str:
         import inspect
@@ -7638,8 +7649,10 @@ class TestVoiceCallListPhase1bMigration:
             "the Phase 1b query must read from the v2 `spans` table."
         )
         assert "builder.build_content_query(" in src
-        assert "batch_span_ids," in src
+        assert "builder.content_root_identities_for_rows(batch_rows)" in src
+        assert "[identity[2] for identity in batch_identities]" in src
         assert "root_identities=batch_identities" in src
+        assert "builder.content_root_rows_match(batch_rows, attrs_result.data)" in src
 
     def test_phase_1b_reads_v2_spans_table(self):
         """Phase 1b must resolve latest state without broad ``FINAL``."""
@@ -7649,21 +7662,21 @@ class TestVoiceCallListPhase1bMigration:
 
         src = self._voice_list_source()
         query, _ = VoiceCallListQueryBuilderV2(
-            project_id="00000000-0000-4000-8000-000000000001"
+            project_id=self._ROOT_IDENTITY[0]
         ).build_content_query(
             ["root-1"],
-            root_identities=[
-                (
-                    "00000000-0000-4000-8000-000000000001",
-                    "trace-1",
-                    "root-1",
-                    datetime(2026, 7, 30, 0, 0),
-                )
-            ],
+            root_identities=[self._ROOT_IDENTITY],
         )
         assert "FROM spans FINAL" not in src
         assert "FROM spans FINAL" not in query
-        assert "argMax(is_deleted, _version) AS latest_is_deleted" in query
+        assert "FROM spans" in query
+        assert "tracer_observation_span" not in query
+        assert query.count("argMax(") == 1
+        assert (
+            "argMax(tuple(start_time, parent_span_id, is_deleted, "
+            "project_version_id, _version,"
+        ) in query
+        assert "_root_snapshot.3 AS latest_is_deleted" in query
         assert "WHERE latest_is_deleted = 0" in query
 
     def test_phase_1b_selects_typed_map_columns_for_reconstruction(self):
@@ -7678,13 +7691,15 @@ class TestVoiceCallListPhase1bMigration:
             VoiceCallListQueryBuilderV2,
         )
 
-        query, _ = VoiceCallListQueryBuilderV2(project_id="proj-1").build_content_query(
-            ["root-1"]
+        query, _ = VoiceCallListQueryBuilderV2(
+            project_id=self._ROOT_IDENTITY[0]
+        ).build_content_query(
+            ["root-1"], root_identities=[self._ROOT_IDENTITY]
         )
         assert "AS span_attributes" in query
         assert "AS attrs_string" in query
-        assert "latest_span_attr_num AS attrs_number" in query
-        assert "latest_span_attr_bool AS attrs_bool" in query
+        assert "AS attrs_number" in query
+        assert "AS attrs_bool" in query
         assert "attributes_extra" in query
 
     def test_phase_1b_python_fallback_merges_typed_maps(self):
@@ -7717,25 +7732,31 @@ class TestVoiceCallListPhase1bMigration:
         )
 
         query, params = VoiceCallListQueryBuilderV2(
-            project_id="00000000-0000-4000-8000-000000000001"
+            project_id=self._ROOT_IDENTITY[0]
         ).build_content_query(
             ["root-1"],
-            root_identities=[
-                (
-                    "00000000-0000-4000-8000-000000000001",
-                    "trace-1",
-                    "root-1",
-                    datetime(2026, 7, 30, 0, 0, 0, 123456),
-                )
-            ],
+            root_identities=[self._ROOT_IDENTITY],
         )
         assert "project_id = %(project_id)s" in query, (
             "Phase 1b must scope by project_id so the primary key can prune."
         )
-        assert "trace_id IN %(content_trace_ids)s" in query
-        assert "toDate(start_time) IN %(content_root_dates)s" in query
-        assert "toUnixTimestamp64Micro(start_time)" in query
-        assert params["content_root_identities"][0][3] % 1_000_000 == 123456
+        assert params["project_id"] == self._ROOT_IDENTITY[0]
+        assert "IN %(content_primary_prefixes)s" in query
+        assert "IN %(content_physical_keys)s" in query
+        assert params["content_root_identities"] == (self._ROOT_IDENTITY,)
+        assert params["content_primary_prefixes"] == (
+            ("conversation", "svc", datetime(2026, 7, 30), "trace-1"),
+        )
+        assert params["content_physical_keys"] == (
+            (
+                self._ROOT_IDENTITY[0],
+                "conversation",
+                "svc",
+                datetime(2026, 7, 30),
+                "trace-1",
+                "root-1",
+            ),
+        )
         # attrs_string Map strip.
         assert "mapFilter" in query and "call_logs" in query, (
             "Phase 1b must exclude `call_logs` from attrs_string at read time."
