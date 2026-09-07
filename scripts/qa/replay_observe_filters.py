@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded, read-only HTTP qualification of Observe filters. No Django/DB imports.
 
-See docs/qa/observe-filter-api-replay.md. A generated case is NOT a test pass;
+A generated case is NOT a test pass;
 an exact HTTP completion without an independent oracle is still UNVERIFIED.
 """
 
