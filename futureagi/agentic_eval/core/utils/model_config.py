@@ -143,6 +143,7 @@ class ModelConfigs:
         model_name="vertex_ai/gemini-3.5-flash",
         temperature=0.2,
         max_tokens=8100,
+        vertex_location="global",
     )
 
     VERTEX_GEMINI_3_6_FLASH: Final[ModelConfig] = ModelConfig(
