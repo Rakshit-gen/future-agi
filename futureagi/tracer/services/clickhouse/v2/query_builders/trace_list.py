@@ -1334,6 +1334,11 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
 class TraceListQueryBuilderV2(V2RewriteMixin, _TraceListQueryBuilderV2Core):
     """Public CH25 trace builder: rewrite the shared planner's output once."""
 
+    # The mixin precedes the core in the MRO and defines an empty default.
+    # Declare exclusions at the public boundary so eval/annotation SQL keeps
+    # its independent source contract, including nested eval replay queries.
+    _v2_rewrite_exclude = _TraceListQueryBuilderV2Core._v2_rewrite_exclude
+
 
 __all__ = [
     "TraceListQueryBuilderV2",

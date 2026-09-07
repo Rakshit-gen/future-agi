@@ -694,6 +694,21 @@ class TestEvalQueryDeletionPredicate:
         assert params["trace_ids"] == ("t1",)
         assert params["eval_config_ids"] == ("ec1",)
 
+    def test_v2_packed_eval_replay_keeps_independent_source_sql(
+        self, project_id, settings
+    ):
+        settings.CH25_EVAL_LOGGER_TABLE = "tracer_eval_logger"
+        legacy = TraceListQueryBuilder(project_id=project_id, eval_config_ids=["ec1"])
+        v2 = TraceListQueryBuilderV2(project_id=project_id, eval_config_ids=["ec1"])
+        # Packing embeds the complete eval query. Span-schema rewriting here
+        # would alter the eval deletion columns and append settings into the
+        # outer GROUP BY after the inner query already received a SETTINGS.
+        query, params = v2.build_eval_replay_query(["trace-1"])
+        assert (query, params) == legacy.build_eval_replay_query(["trace-1"])
+        assert "SETTINGS" not in query
+        assert "_peerdb_is_deleted AS latest_state_0" in query
+        assert query.rstrip().endswith("GROUP BY trace_id")
+
     def test_page_500_by_11_eval_replay_is_packed_below_result_row_cap(
         self, project_id
     ):

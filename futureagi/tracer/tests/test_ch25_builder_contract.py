@@ -317,7 +317,10 @@ class TestListBuilderOutputContract:
                 if builder.supports_filter_candidate_seed_page():
                     start, end = builder.parse_time_range(builder.filters)
                     result = method(slice_start=start, slice_end=end, limit=2)
-                elif type(builder).__name__ == "TraceListQueryBuilderV2":
+                elif type(builder).__name__ in {
+                    "TraceListQueryBuilderV2",
+                    "VoiceCallListQueryBuilderV2",
+                }:
                     original_filters = builder.filters
                     original_internal_scan = builder._bounded_internal_scan
                     builder.filters = [
@@ -334,6 +337,17 @@ class TestListBuilderOutputContract:
                             },
                         },
                     ]
+                    if type(builder).__name__ == "VoiceCallListQueryBuilderV2":
+                        builder.filters[-1] = {
+                            "column_id": "call.recording.url",
+                            "filter_config": {
+                                "col_type": "SPAN_ATTRIBUTE",
+                                "filter_type": "text",
+                                "filter_op": "equals",
+                                "filter_value": "https://recordings.example.invalid/"
+                                + "a" * 100,
+                            },
+                        }
                     builder._bounded_internal_scan = False
                     try:
                         start, end = builder.parse_time_range(builder.filters)
@@ -483,10 +497,10 @@ class TestListBuilderOutputContract:
                         }
                     ]
                 )
-            elif (
-                name == "build_content_query"
-                and type(builder).__name__ == "TraceListQueryBuilderV2"
-            ):
+            elif name == "build_content_query" and type(builder).__name__ in {
+                "TraceListQueryBuilderV2",
+                "VoiceCallListQueryBuilderV2",
+            }:
                 start, _ = builder.parse_time_range(builder.filters)
                 rows = [
                     complete_root_row(
@@ -499,7 +513,11 @@ class TestListBuilderOutputContract:
                     )
                 ]
                 result = method(
-                    ["dummy-trace-id"],
+                    [
+                        "dummy-span-id"
+                        if type(builder).__name__ == "VoiceCallListQueryBuilderV2"
+                        else "dummy-trace-id"
+                    ],
                     root_identities=builder.content_root_identities_for_rows(rows),
                 )
             elif name in {
@@ -519,7 +537,10 @@ class TestListBuilderOutputContract:
                         "start_time": start,
                     }
                 ]
-                if type(builder).__name__ == "TraceListQueryBuilderV2":
+                if type(builder).__name__ in {
+                    "TraceListQueryBuilderV2",
+                    "VoiceCallListQueryBuilderV2",
+                }:
                     rows = [complete_root_row(row) for row in rows]
                 result = method(rows)
             else:

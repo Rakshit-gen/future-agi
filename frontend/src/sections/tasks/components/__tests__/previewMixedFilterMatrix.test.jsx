@@ -349,7 +349,9 @@ describe("offline mixed-filter preview matrix", () => {
       mocks.get.mockImplementation((url, config) => {
         if (
           url !== ENDPOINTS[rowType] ||
-          JSON.parse(config.params.filters).length === 0
+          !JSON.parse(config.params.filters).some(
+            (filter) => filter.filter_config.col_type === "SPAN_ATTRIBUTE",
+          )
         )
           return defaultGet(url, config);
         filteredReads += 1;
@@ -365,12 +367,37 @@ describe("offline mixed-filter preview matrix", () => {
         );
       }
       await waitFor(() => expect(filteredReads).toBe(2));
-      const requests = listCalls(rowType).filter(
-        ([, config]) => JSON.parse(config.params.filters).length > 0,
+      const requests = listCalls(rowType).filter(([, config]) =>
+        JSON.parse(config.params.filters).some(
+          (filter) => filter.filter_config.col_type === "SPAN_ATTRIBUTE",
+        ),
       );
       expect(requests).toHaveLength(2);
       for (const [, config] of requests) {
-        expect(JSON.parse(config.params.filters)).toEqual(filters);
+        const actual = JSON.parse(config.params.filters);
+        expect(
+          actual.filter(
+            (filter) => filter.filter_config.col_type === "SPAN_ATTRIBUTE",
+          ),
+        ).toEqual(filters);
+        const dates = actual.filter(
+          (filter) => filter.column_id === "created_at",
+        );
+        expect(dates).toHaveLength(surface === "Eval" ? 1 : 0);
+        if (surface === "Eval") {
+          expect(dates[0].filter_config).toMatchObject({
+            filter_type: "datetime",
+            filter_op: "between",
+          });
+          expect(dates[0]).toEqual(
+            JSON.parse(requests[0][1].params.filters).find(
+              (filter) => filter.column_id === "created_at",
+            ),
+          );
+          expect(
+            screen.getByRole("button", { name: "Past 30D" }),
+          ).toBeVisible();
+        }
         expect(config.params).toMatchObject({
           project_id: PROJECT,
           cursor_mode: true,
@@ -384,7 +411,7 @@ describe("offline mixed-filter preview matrix", () => {
     },
   );
 
-describe("sanitized fixture keys with synthetic values and independent dates", () => {
+  describe("sanitized fixture keys with synthetic values and independent dates", () => {
     it.each(
       matrix.flatMap(([surface, rowType]) =>
         CATALOG_DATE_RANGES.map(([window, range]) => [
