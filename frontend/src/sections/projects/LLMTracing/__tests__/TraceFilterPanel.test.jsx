@@ -2549,7 +2549,7 @@ describe("voice-call property parity", () => {
     ).toContainEqual(
       expect.objectContaining({
         id: "user_id",
-        registryId: "system_attribute:users:user_id",
+        registryId: "system_attribute:users:user",
       }),
     );
   });
@@ -3936,6 +3936,43 @@ describe("exact manual attribute fallback", () => {
 });
 
 describe("filter-value picker bounded-read UX", () => {
+  it.each([
+    ["users", "system", "SYSTEM_METRIC", "system_attribute:users:user", "user", "sessions"],
+    ["sessions", "system", "SYSTEM_METRIC", "system_attribute:sessions:user", "user", "sessions"],
+    ["users", "attribute", "SPAN_ATTRIBUTE", "custom_attribute:user_id", "user_id", "traces"],
+  ])("keeps %s %s User ID suggestions consistent with their registry identity", async (
+    propertyNamespace, category, apiColType, propertyId, metricName, valueSource,
+  ) => {
+    const onApply = vi.fn();
+    dashboardFilterValuesMock.mockImplementation((request) => ({
+      ...defaultDashboardFilterValues(),
+      data: request.propertyId === propertyId && request.metricName === metricName
+        ? [{ value: "example-user", label: "example-user" }]
+        : [],
+    }));
+    const { anchorEl } = renderPanel({
+      source: "sessions",
+      propertyNamespace,
+      projectId: "project-user-values",
+      properties: [{ id: "user_id", name: "User ID", category, type: "string", apiColType }],
+      currentFilters: [{
+        field: "user_id", fieldName: "User ID", fieldCategory: category,
+        fieldType: "string", apiColType, operator: "in", value: [],
+      }],
+      onApply,
+    });
+
+    fireEvent.click(document.querySelector('[data-filter-value-trigger="user_id"]'));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "example-user" }));
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(expect.objectContaining({
+      propertyId, metricName, source: valueSource, enabled: true,
+    }));
+    await waitFor(() => expect(onApply).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ field: "user_id", apiColType, value: ["example-user"] }),
+    ])));
+    document.body.removeChild(anchorEl);
+  });
+
   const statusProperty = {
     id: "call.status",
     name: "Status",
@@ -4289,8 +4326,8 @@ describe("filter-value picker bounded-read UX", () => {
       "sessions",
       "user_id",
       "User ID",
-      "user_id",
-      "system_attribute:users:user_id",
+      "user",
+      "system_attribute:users:user",
       "users",
     ],
   ])(
@@ -5562,6 +5599,28 @@ describe("filter-value picker bounded-read UX", () => {
         ),
       { timeout: 1_500 },
     );
+    document.body.removeChild(anchorEl);
+  });
+
+  it.each(["users", "sessions"])("uses the canonical %s identity for Query-tab User ID values", async (propertyNamespace) => {
+    const { anchorEl } = renderPanel({
+      properties: [{ id: "user_id", name: "User ID", category: "system", type: "string", apiColType: "SYSTEM_METRIC" }],
+      projectId: "project-user-query",
+      source: "sessions",
+      propertyNamespace,
+      showQueryTab: true,
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    await selectQueryPhaseOption("User ID", "pick operator...");
+    await waitFor(() => expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        propertyId: `system_attribute:${propertyNamespace}:user`,
+        metricName: "user",
+        metricType: "system_metric",
+        source: "sessions",
+        enabled: true,
+      }),
+    ));
     document.body.removeChild(anchorEl);
   });
 

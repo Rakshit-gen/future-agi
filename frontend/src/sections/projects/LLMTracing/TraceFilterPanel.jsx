@@ -118,8 +118,21 @@ function useSingleFlightPageRequest({ identity, enabled, request }) {
   }, [enabled, identity, request]);
 }
 
-const filterValueAdapterMetricName = (source, propertyId) =>
-  source === "sessions" && propertyId === "session_id" ? "session" : propertyId;
+const filterValueAdapterMetricName = (source, propertyId, metricType) => {
+  if (
+    metricType !== "system_metric" ||
+    !["traces", "spans", "sessions", "users"].includes(source)
+  ) {
+    return propertyId;
+  }
+  // Registry identities use these canonical dimension names. Keep the native
+  // filter column spelling in the row, and never rename same-name attributes.
+  return (
+    { project_id: "project", session_id: "session", user_id: "user" }[
+      propertyId
+    ] || propertyId
+  );
+};
 
 const filterValueTransportSource = (source, metricType) =>
   source === "sessions" && metricType === "custom_attribute"
@@ -388,6 +401,7 @@ function attachPropertyRegistryIdentity(
   const metricName = filterValueAdapterMetricName(
     source,
     property.id || property.value || "",
+    metricType,
   );
   return {
     ...property,
@@ -2768,6 +2782,7 @@ function ValuePicker({
   const filterValueMetricName = filterValueAdapterMetricName(
     filterValueSource,
     propertyId,
+    metricType,
   );
   const filterValuePropertyId = buildPropertyRegistryId({
     propertyId: property?.registryId,
@@ -4587,6 +4602,7 @@ const TraceFilterPanel = ({
   const queryValueMetricName = filterValueAdapterMetricName(
     queryValueSource,
     queryFieldProp?.id || activeQueryField || "",
+    queryMetricType,
   );
   const isQuerySessionFreeTextField =
     queryValueSource === "sessions" &&
