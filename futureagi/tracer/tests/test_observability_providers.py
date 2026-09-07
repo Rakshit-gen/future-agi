@@ -25,6 +25,7 @@ from tracer.services.observability_providers import (
     ObservabilityService,
     RetellConfigurationError,
     RetellCursorRejected,
+    _retell_page_digest,
     _retell_retry_after_seconds,
 )
 from tracer.tests.fixtures.retell_calls import (
@@ -1628,6 +1629,280 @@ class TestFetchRetellPageHydration:
 
         assert exc_info.value.response.status_code == 401
         assert arrivals == n
+
+
+class TestFetchRetellPageResumeAndDeadline:
+    """v1.15 A1-A3: the listed page's digest, how far a response got into it,
+    and resuming the rest of it under a deadline."""
+
+    def test_digest_is_over_the_listed_ids_in_order_and_none_when_empty(
+        self, no_extra_credentials
+    ):
+        """v1.15.1 F2: the digest pins the ids AND their order. A resume skips
+        items [:k] by position, so a page whose members were re-shuffled must
+        read as a different page or that prefix skips the wrong calls."""
+        provider = _provider_with_agent()
+        end = _end()
+        items = [
+            list_item("call_zulu", 1_000, 2_000),
+            list_item("call_alpha", 1_000, 2_000),
+        ]
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+        ):
+            mock_post.return_value = _list_response(items)
+            mock_get.side_effect = lambda url, **kw: _detail_response(
+                url.rsplit("/", 1)[-1], 1_000, 2_000
+            )
+            page = ObservabilityService.fetch_retell_page(provider, None, end)
+
+        assert page.digest == _retell_page_digest(
+            [{"call_id": "call_zulu"}, {"call_id": "call_alpha"}]
+        )
+        assert page.digest != _retell_page_digest(
+            [{"call_id": "call_alpha"}, {"call_id": "call_zulu"}]
+        )  # same members, new order: a different page
+        assert "call_alpha" not in page.digest and len(page.digest) == 64
+
+        with patch(
+            "tracer.services.observability_providers.requests.post"
+        ) as mock_post:
+            mock_post.return_value = _list_response([])
+            empty = ObservabilityService.fetch_retell_page(provider, None, end)
+        assert empty.digest is None
+        assert empty.listed == 0 and empty.consumed == 0 and empty.indices == ()
+
+    def test_a_re_ordered_page_is_not_resumed_against_its_old_prefix(
+        self, no_extra_credentials
+    ):
+        """The loss F2 prevents: the same five calls come back re-ordered, so
+        the remembered digest no longer matches and the whole page is hydrated
+        again instead of skipping two calls that are no longer at the front."""
+        provider = _provider_with_agent()
+        end = _end()
+        items = [list_item(f"c{i}", 1_000, 2_000) for i in range(5)]
+        old_digest = _retell_page_digest(items)
+        reordered = items[3:] + items[:3]
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+        ):
+            mock_post.return_value = _list_response(reordered)
+            mock_get.side_effect = lambda url, **kw: _detail_response(
+                url.rsplit("/", 1)[-1], 1_000, 2_000
+            )
+            page = ObservabilityService.fetch_retell_page(
+                provider, None, end, resume_from=2, resume_digest=old_digest
+            )
+
+        assert page.digest != old_digest
+        assert mock_get.call_count == 5  # hydrated from 0, not from 2
+        assert page.indices == (0, 1, 2, 3, 4)
+
+    def test_listed_consumed_and_indices_with_drops_interleaved(
+        self, no_extra_credentials
+    ):
+        """A1/A3: every listed item's fate is decided, so `consumed == listed`
+        on a page that hydrated to the end however many items it dropped, and
+        `indices` names the LIST position of each returned call."""
+        provider = _provider_with_agent()
+        end = _end()
+        no_id = list_item("c1", 1_000, 2_000)
+        del no_id["call_id"]
+        items = [
+            list_item("c0", 1_000, 2_000),  # 0: hydrates
+            list_item("c1", 1_000, None),  # 1: no end_timestamp
+            list_item("c2", 1_000, 2_000),  # 2: hydrates
+            no_id,  # 3: no id
+            list_item("c4", 1_000, 2_000),  # 4: 422
+            list_item("c5", 1_000, 2_000),  # 5: 500 x3
+        ]
+
+        def get_side_effect(url, **kwargs):
+            call_id = url.rsplit("/", 1)[-1]
+            if call_id == "c4":
+                return _http_error_response(422)
+            if call_id == "c5":
+                return _http_error_response(500)
+            return _detail_response(call_id, 1_000, 2_000)
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+            patch("tracer.services.observability_providers._sleep"),
+            patch(
+                "tracer.services.observability_providers.random.uniform", return_value=0
+            ),
+        ):
+            mock_post.return_value = _list_response(items)
+            mock_get.side_effect = get_side_effect
+            page = ObservabilityService.fetch_retell_page(provider, None, end)
+
+        assert page.listed == 6
+        assert page.consumed == 6  # every item's fate decided
+        assert [c["call_id"] for c in page.calls] == ["c0", "c2"]
+        assert page.indices == (0, 2)
+        assert page.dropped_no_end == 1
+        assert page.dropped_missing == 2  # the id-less item and the 422
+        assert page.dropped_failed == 1
+        # v1.15.2 F8: each drop also names the list index it happened at, in
+        # list order, so a caller resuming this page can tell which drops are
+        # behind its resume point and which it is about to be told about again.
+        assert page.drops == ((1, 3), (3, 4), (4, 4), (5, 5))
+
+    def test_resume_from_with_the_matching_digest_hydrates_only_the_tail(
+        self, no_extra_credentials
+    ):
+        provider = _provider_with_agent()
+        end = _end()
+        items = [list_item(f"c{i}", 1_000, 2_000) for i in range(5)]
+        digest = _retell_page_digest(items)
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+        ):
+            mock_post.return_value = _list_response(items)
+            mock_get.side_effect = lambda url, **kw: _detail_response(
+                url.rsplit("/", 1)[-1], 1_000, 2_000
+            )
+            page = ObservabilityService.fetch_retell_page(
+                provider, None, end, resume_from=2, resume_digest=digest
+            )
+
+        assert mock_get.call_count == 3  # listed - resume_from
+        assert [c["call_id"] for c in page.calls] == ["c2", "c3", "c4"]
+        assert page.indices == (2, 3, 4)
+        assert page.consumed == 5  # the skipped items count as consumed
+
+    def test_mismatched_resume_digest_hydrates_from_zero(self, no_extra_credentials):
+        provider = _provider_with_agent()
+        end = _end()
+        items = [list_item(f"c{i}", 1_000, 2_000) for i in range(3)]
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+        ):
+            mock_post.return_value = _list_response(items)
+            mock_get.side_effect = lambda url, **kw: _detail_response(
+                url.rsplit("/", 1)[-1], 1_000, 2_000
+            )
+            page = ObservabilityService.fetch_retell_page(
+                provider, None, end, resume_from=2, resume_digest="not-this-page"
+            )
+
+        assert mock_get.call_count == 3
+        assert page.indices == (0, 1, 2)
+        assert page.digest != "not-this-page"  # the caller sees the mismatch
+
+    def test_a_deadline_already_past_submits_nothing(self, no_extra_credentials):
+        """A2: nothing is submitted once the deadline has gone; `consumed`
+        stops at the first candidate, and drops decided before it still count."""
+        provider = _provider_with_agent()
+        end = _end()
+        items = [
+            list_item("c0", 1_000, None),  # 0: dropped before the first candidate
+            list_item("c1", 1_000, 2_000),  # 1: the first candidate
+            list_item("c2", 1_000, 2_000),
+        ]
+        now = _end(hours=5)
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+            patch(
+                "tracer.services.observability_providers.timezone.now", return_value=now
+            ),
+        ):
+            mock_post.return_value = _list_response(items)
+            page = ObservabilityService.fetch_retell_page(
+                provider, None, end, deadline=now - timedelta(seconds=1)
+            )
+
+        mock_get.assert_not_called()
+        assert page.calls == [] and page.indices == ()
+        assert page.consumed == 1
+        assert page.listed == 3
+        assert page.dropped_no_end == 1
+        assert page.drops == ((0, 3),)  # decided before consumption stopped
+
+    def test_a_deadline_passing_mid_page_stops_further_submissions(
+        self, no_extra_credentials
+    ):
+        """A2/A3: the requests already submitted finish and stay in list order;
+        `consumed` is the index of the first candidate never submitted."""
+        provider = _provider_with_agent()
+        end = _end()
+        items = [list_item(f"c{i}", 1_000, 2_000) for i in range(5)]
+        start = _end(hours=5)
+        tick = timedelta(seconds=10)
+        clock = {"t": start}
+
+        def get_side_effect(url, **kwargs):
+            clock["t"] = clock["t"] + tick  # each detail fetch costs `tick`
+            return _detail_response(url.rsplit("/", 1)[-1], 1_000, 2_000)
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+            patch(
+                "tracer.services.observability_providers.timezone.now",
+                side_effect=lambda: clock["t"],
+            ),
+            # One worker keeps the interleaving of fetch and clock deterministic;
+            # the submission gate itself is worker-count independent.
+            patch(
+                "tracer.services.observability_providers.RETELL_HYDRATION_WORKERS", 1
+            ),
+        ):
+            mock_post.return_value = _list_response(items)
+            mock_get.side_effect = get_side_effect
+            page = ObservabilityService.fetch_retell_page(
+                provider, None, end, deadline=start + 3 * tick
+            )
+
+        assert mock_get.call_count == 3
+        assert [c["call_id"] for c in page.calls] == ["c0", "c1", "c2"]
+        assert page.indices == (0, 1, 2)
+        assert page.consumed == 3
+        assert page.listed == 5
+
+    def test_duplicate_call_id_keeps_the_last_occurrence_and_its_index(
+        self, no_extra_credentials
+    ):
+        """A1: last wins, as before — and `indices` reports THAT occurrence, so
+        storing in index order can never skip an earlier item."""
+        provider = _provider_with_agent()
+        end = _end()
+        items = [
+            list_item("c1", 1_000, 2_000),
+            list_item("c2", 1_000, 2_000),
+            list_item("c1", 1_000, 2_000),
+        ]
+
+        with (
+            patch("tracer.services.observability_providers.requests.post") as mock_post,
+            patch("tracer.services.observability_providers.requests.get") as mock_get,
+            patch(
+                "tracer.services.observability_providers.RETELL_HYDRATION_WORKERS", 1
+            ),
+        ):
+            mock_post.return_value = _list_response(items)
+            mock_get.side_effect = [
+                _detail_response("c1", 1_000, 2_000, with_recording=False),
+                _detail_response("c2", 1_000, 2_000),
+                _detail_response("c1", 1_000, 2_000, with_recording=True),
+            ]
+            page = ObservabilityService.fetch_retell_page(provider, None, end)
+
+        assert [c["call_id"] for c in page.calls] == ["c2", "c1"]  # ordered by index
+        assert page.indices == (1, 2)
+        assert page.calls[1].get("recording_url") is not None  # the LAST occurrence
+        assert page.consumed == 3
 
 
 @pytest.mark.django_db

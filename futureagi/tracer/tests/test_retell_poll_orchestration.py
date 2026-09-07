@@ -9,6 +9,7 @@ test seam in contract §7.
 
 from __future__ import annotations
 
+import itertools
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -24,12 +25,15 @@ from tracer.services.observability_providers import (
     RetellConfigurationError,
     RetellCursorRejected,
     RetellPage,
+    _retell_page_digest,
 )
 from tracer.utils import observability_provider as op
 
 pytestmark = pytest.mark.unit
 
 UTC = UTC
+
+_UNSET = object()
 
 
 def _dt(*args, **kwargs) -> datetime:
@@ -41,22 +45,53 @@ def _page(
     *,
     has_more=False,
     next_key=None,
-    dropped_no_end=0,
-    dropped_missing=0,
-    dropped_failed=0,
+    drops=(),
+    digest=_UNSET,
+    listed=None,
+    consumed=None,
+    indices=None,
 ) -> RetellPage:
+    """A fully hydrated page by default: every listed item came back as a call,
+    at consecutive indices, and the digest is the one the fetcher would have
+    produced for exactly those ids. Tests about resuming, truncation or a
+    changed page pass the fields they are actually about.
+
+    Drops are described the way the fetcher describes them — ``(list index,
+    slot)`` pairs — and the three scalars are derived from them here, so a test
+    cannot build a page whose totals and whose per-index drops disagree.
+    """
+    calls = calls or []
+    drops = tuple(drops)
     return RetellPage(
-        calls=calls or [],
+        calls=calls,
         has_more=has_more,
         next_key=next_key,
-        dropped_no_end=dropped_no_end,
-        dropped_missing=dropped_missing,
-        dropped_failed=dropped_failed,
+        dropped_no_end=sum(1 for _index, slot in drops if slot == 3),
+        dropped_missing=sum(1 for _index, slot in drops if slot == 4),
+        dropped_failed=sum(1 for _index, slot in drops if slot == 5),
+        digest=_retell_page_digest(calls) if digest is _UNSET else digest,
+        listed=len(calls) if listed is None else listed,
+        consumed=(len(calls) if listed is None else listed)
+        if consumed is None
+        else consumed,
+        indices=tuple(range(len(calls))) if indices is None else tuple(indices),
+        drops=drops,
     )
 
 
 def _calls(n: int, prefix: str = "call") -> list[dict]:
     return [{"call_id": f"{prefix}_{i}"} for i in range(n)]
+
+
+def _store_each(stored=1, malformed=0, export_failed=0):
+    """``process_and_store_logs`` is called once per call now (v1.15 B5), so a
+    fake that returns a fixed StoreOutcome describes ONE call, not a page."""
+
+    def fake(logs, *args, **kwargs):
+        n = len(logs)
+        return op.StoreOutcome(stored * n, malformed * n, export_failed * n)
+
+    return fake
 
 
 # --------------------------------------------------------------------------
@@ -204,11 +239,12 @@ def _freeze_now(monkeypatch, when: datetime):
     monkeypatch.setattr(op.timezone, "now", lambda: when)
 
 
-def _freeze_now_then_over_budget(monkeypatch, when: datetime):
-    """`timezone.now()` returns `when` on its FIRST call and
-    `when + RETELL_RUN_BUDGET` (well past the F2 per-run budget) on every
-    call after that — within one call to this helper; call it again fresh
-    before each `_poll_retell_provider` invocation that needs it, it does not
+def _freeze_now_then_over_budget(monkeypatch, when: datetime, *, calls_per_page=1):
+    """`timezone.now()` returns `when` for the run's start and for the
+    `calls_per_page` in-page checks of the first page, then
+    `when + RETELL_RUN_BUDGET` (well past the F2 per-run budget) on every call
+    after that — within one call to this helper; call it again fresh before
+    each `_poll_retell_provider` invocation that needs it, it does not
     accumulate across invocations.
 
     Use where a fake fetch returns identical ``has_more=True`` content on
@@ -219,12 +255,16 @@ def _freeze_now_then_over_budget(monkeypatch, when: datetime):
     restart. Reproducing "the budget happened to run out after this one
     (slow) page" is the faithful way to keep that single-page-per-run
     behaviour without weakening what the test actually checks.
+
+    `calls_per_page` must be the number of calls on that page: v1.15 B5 reads
+    the clock once per stored call, so a smaller value would make the run
+    checkpoint MID-page instead of completing the page these tests are about.
     """
     calls = {"n": 0}
 
     def fake_now():
         calls["n"] += 1
-        return when if calls["n"] == 1 else when + op.RETELL_RUN_BUDGET
+        return when if calls["n"] <= 1 + calls_per_page else when + op.RETELL_RUN_BUDGET
 
     monkeypatch.setattr(op.timezone, "now", fake_now)
 
@@ -447,14 +487,12 @@ def test_bootstrap_runs_regardless_of_old_watermark_and_preserves_other_keys_dis
     _freeze_now(monkeypatch, now)
     seen_bounds = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         seen_bounds.append((start, end))
         return _page(_calls(3))
 
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(3, 0, 0)
-    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
 
     outcome = op._poll_retell_provider(provider)
 
@@ -488,7 +526,9 @@ def test_bootstrap_discards_a_valid_stale_ordinary_window_not_just_an_invalid_on
         "key": "stale-cursor",
         "skip": None,
         "pages_stored": 2,
-        "total_pages": 2,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": ["deadbeef"],
         "restarts": 0,
     }
@@ -501,7 +541,7 @@ def test_bootstrap_discards_a_valid_stale_ordinary_window_not_just_an_invalid_on
     _freeze_now(monkeypatch, now)
     seen_bounds = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         seen_bounds.append((start, end, pagination_key))
         return _page(_calls(1), has_more=False)
 
@@ -537,7 +577,9 @@ def test_bootstrap_resumes_its_own_stale_bootstrap_window_instead_of_discarding_
         "key": "resume-me",
         "skip": None,
         "pages_stored": 2,
-        "total_pages": 2,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": ["deadbeef"],
         "restarts": 0,
     }
@@ -547,7 +589,7 @@ def test_bootstrap_resumes_its_own_stale_bootstrap_window_instead_of_discarding_
     _freeze_now(monkeypatch, now)
     seen = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         seen.append((start, end, pagination_key))
         return _page(_calls(1), has_more=False)
 
@@ -561,86 +603,6 @@ def test_bootstrap_resumes_its_own_stale_bootstrap_window_instead_of_discarding_
     assert seen == [(None, op._parse(frozen_end), "resume-me")]  # resumed, not reopened
 
 
-def test_v1_13_persisted_window_without_total_pages_is_resumed_not_discarded(
-    fake_table, monkeypatch
-):
-    # F4/N5: a window persisted by v1.13, before B7 added "total_pages", has
-    # no such key and would otherwise fail `_valid_window` on deploy — the
-    # window would be silently discarded and its range re-listed from
-    # `last_fetched_at` instead of resumed. `_backfill_total_pages` must set
-    # it (from `pages_stored`) BEFORE validation runs, so the window resumes.
-    pid = uuid.uuid4()
-    now = _dt(2026, 1, 1, 12, 0, 0)
-    wm = now - timedelta(hours=1)
-    v1_13_window = {
-        "start": (now - timedelta(minutes=30)).isoformat(),
-        "end": (now - op.RETELL_VISIBILITY_LAG).isoformat(),
-        "opened_at_hint": False,
-        "narrowed": False,
-        "key": "v1-13-cursor",
-        "skip": None,
-        "pages_stored": 2,
-        # deliberately no "total_pages" key: this is exactly the v1.13 shape
-        "digests": ["deadbeef"],
-        "restarts": 0,
-    }
-    row = _FakeRow(
-        id=pid,
-        last_fetched_at=wm,
-        poll_state={"retell": {"bootstrapped": True, "window": v1_13_window}},
-    )
-    fake_table[pid] = row
-    provider = _retell_provider(row)
-    # Frozen-then-over-budget: the fake fetch below returns byte-identical
-    # content on every call, so a genuinely frozen clock would let the F2
-    # budget loop try a second, identical page in this same run and hit a
-    # spurious page_repeated restart — see `_freeze_now_then_over_budget`.
-    # This test only cares about the ONE page's resume-then-persist outcome.
-    _freeze_now_then_over_budget(monkeypatch, now)
-    seen = []
-
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
-        seen.append((start, end, pagination_key))
-        return _page(_calls(1, "new"), has_more=True, next_key="v1-13-cursor-2")
-
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
-    )
-
-    op._poll_retell_provider(provider)
-
-    # Resumed from the persisted cursor and window bounds — NOT reopened from
-    # `last_fetched_at`, which would have queried `(wm, end)` instead.
-    assert seen == [
-        (
-            op._parse(v1_13_window["start"]),
-            op._parse(v1_13_window["end"]),
-            "v1-13-cursor",
-        )
-    ]
-    window = fake_table[pid].poll_state["retell"]["window"]
-    assert (
-        window["total_pages"] == 3
-    )  # backfilled from pages_stored=2, then incremented
-    assert window["pages_stored"] == 3
-
-
-def test_backfill_total_pages_is_a_noop_when_the_key_is_already_present():
-    # F4: a window already carrying "total_pages" (B7-and-later) must not
-    # have it overwritten by the backfill.
-    window = {"pages_stored": 5, "total_pages": 9}
-    op._backfill_total_pages(window)
-    assert window["total_pages"] == 9
-
-
-def test_backfill_total_pages_ignores_non_dict_input():
-    # F4: called unconditionally ahead of `_valid_window`, so it must not
-    # raise on `None` or any other malformed value already handled downstream.
-    op._backfill_total_pages(None)
-    op._backfill_total_pages("not-a-window")
-
-
 def test_bootstrap_has_more_is_logged_not_raised(fake_table, monkeypatch):
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
@@ -651,15 +613,13 @@ def test_bootstrap_has_more_is_logged_not_raised(fake_table, monkeypatch):
     # a genuinely frozen clock would let the new budget loop try a second,
     # identical page in the same run and hit a spurious page_repeated
     # restart. This test only cares about one page's outcome/logging.
-    _freeze_now_then_over_budget(monkeypatch, now)
+    _freeze_now_then_over_budget(monkeypatch, now, calls_per_page=1000)
     monkeypatch.setattr(
         op.ObservabilityService,
         "fetch_retell_page",
         lambda *a, **k: _page(_calls(1000), has_more=True, next_key=None),
     )
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1000, 0, 0)
-    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
 
     with capture_logs() as cap:
         outcome = op._poll_retell_provider(provider)  # must not raise
@@ -732,10 +692,10 @@ def test_bootstrap_total_failure_backs_off_and_sets_no_marker(fake_table, monkey
     provider = _retell_provider(row)
     _freeze_now(monkeypatch, now)
     monkeypatch.setattr(
-        op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page()
+        op.ObservabilityService, "fetch_retell_page", lambda *a, **k: _page(_calls(1))
     )
     monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 500)
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 1)
     )
 
     result = op._poll_retell_provider(provider)
@@ -762,15 +722,13 @@ def test_bootstrap_page_one_has_more_persists_window_marker_not_set(
     # F2: identical content on every call — see the comment on
     # _freeze_now_then_over_budget for why a plain frozen clock would break
     # this "exactly one page this run" assertion.
-    _freeze_now_then_over_budget(monkeypatch, now)
+    _freeze_now_then_over_budget(monkeypatch, now, calls_per_page=5)
     monkeypatch.setattr(
         op.ObservabilityService,
         "fetch_retell_page",
         lambda *a, **k: _page(_calls(5), has_more=True, next_key="page-2-key"),
     )
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(5, 0, 0)
-    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
 
     outcome = op._poll_retell_provider(provider)
 
@@ -815,7 +773,7 @@ def test_bootstrap_completes_on_second_page_marker_set_watermark_is_first_run_en
     _freeze_now(monkeypatch, later)
     seen = []
 
-    def resume_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def resume_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         seen.append((start, end, pagination_key))
         return _page(_calls(1, "p2"), has_more=False)
 
@@ -848,7 +806,9 @@ def test_bootstrap_capped_at_max_pages_completes(fake_table, monkeypatch):
                     "key": "cursor-9",
                     "skip": None,
                     "pages_stored": op.RETELL_BOOTSTRAP_MAX_PAGES - 1,
-                    "total_pages": op.RETELL_BOOTSTRAP_MAX_PAGES - 1,
+                    "progress": 0,
+                    "page_digest": None,
+                    "page_counts": [0, 0, 0, 0, 0, 0],
                     "digests": [],
                     "restarts": 0,
                 }
@@ -873,146 +833,223 @@ def test_bootstrap_capped_at_max_pages_completes(fake_table, monkeypatch):
     assert outcome == op.StoreOutcome(1, 0, 0)
     assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
     assert fake_table[pid].last_fetched_at == op._parse(frozen_end)
-    assert (
-        {
-            "event": "retell_bootstrap_capped",
-            "log_level": "info",
-            "provider_id": str(pid),
-            "pages_stored": op.RETELL_BOOTSTRAP_MAX_PAGES,
-            "total_pages": op.RETELL_BOOTSTRAP_MAX_PAGES,  # F7/N8: no restart in this run, so equal to pages_stored
-        }
-        in cap
-    )
+    # v1.15 B8: `total_pages` is gone from the event with the counter itself.
+    assert {
+        "event": "retell_bootstrap_capped",
+        "log_level": "info",
+        "provider_id": str(pid),
+        "pages_stored": op.RETELL_BOOTSTRAP_MAX_PAGES,
+    } in cap
 
 
-def test_bootstrap_capped_counts_total_pages_across_a_restart(fake_table, monkeypatch):
-    # F1/H1: RETELL_BOOTSTRAP_MAX_PAGES must bound `total_pages`, which
-    # `_restart_window` never resets — not `pages_stored`, which it zeroes on
-    # every restart. Store pages up to one below the cap, force a restart
-    # (which zeroes pages_stored back to 0 but must leave total_pages alone),
-    # then store one more page: the cap must still fire at the (restart-spanning) total.
-    pid = uuid.uuid4()
-    now = _dt(2026, 1, 1, 12, 0, 0)
-    row = _FakeRow(id=pid, poll_state={})
-    fake_table[pid] = row
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 0)
-    )
+def _reject_all(*args, **kwargs):
+    raise RetellCursorRejected(cause="missing_key")
 
-    # Store pages until one below the cap. Each page's content is unique (p0,
-    # p1, ...) so the unrelated digest-repeat restart guard never fires — a
-    # repeated call_id across separate simulated runs would trip that
-    # invariant regardless of F1/F2. Each iteration re-freezes the clock
-    # (over-budget-after-one-page) so the F2 run-budget loop does not itself
-    # try a second page inside a single `_poll_retell_provider` call.
-    for i in range(op.RETELL_BOOTSTRAP_MAX_PAGES - 1):
+
+def _drive_bootstrap_pages(fake_table, monkeypatch, pid, when, count, *, prefix):
+    """`count` separate simulated runs, each storing exactly one bootstrap page
+    of unique content. Returns, per run, whether the bootstrap cap fired."""
+    fired = []
+    for i in range(count):
         monkeypatch.setattr(
             op.ObservabilityService,
             "fetch_retell_page",
             lambda *a, i=i, **k: _page(
-                _calls(1, f"p{i}"), has_more=True, next_key=f"k{i}"
+                _calls(1, f"{prefix}{i}"), has_more=True, next_key=f"{prefix}-k{i}"
             ),
         )
-        _freeze_now_then_over_budget(monkeypatch, now)
-        provider = _retell_provider(fake_table[pid])
-        op._poll_retell_provider(provider)
-    window = fake_table[pid].poll_state["retell"]["window"]
-    assert window["total_pages"] == op.RETELL_BOOTSTRAP_MAX_PAGES - 1
-    assert window["pages_stored"] == op.RETELL_BOOTSTRAP_MAX_PAGES - 1
+        _freeze_now_then_over_budget(monkeypatch, when)
+        with capture_logs() as cap:
+            op._poll_retell_provider(_retell_provider(fake_table[pid]))
+        fired.append(any(e["event"] == "retell_bootstrap_capped" for e in cap))
+    return fired
 
-    # Force a restart: pages_stored/key/digests reset, total_pages untouched.
-    def raise_rejected(*a, **k):
-        raise RetellCursorRejected(cause="missing_key")
 
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", raise_rejected)
+def _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, when):
+    """RETELL_MAX_WINDOW_RESTARTS cursor-mode restarts (which switch the
+    bootstrap to offset mode) plus that many again in offset mode: the point
+    where paging has failed every way there is."""
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", _reject_all)
+    _freeze_now(monkeypatch, when)
+    for _ in range(2 * op.RETELL_MAX_WINDOW_RESTARTS):
+        assert op._poll_retell_provider(_retell_provider(fake_table[pid])) is None
+
+
+def test_bootstrap_cap_fires_on_ten_contiguous_pages(fake_table, monkeypatch):
+    # v1.15 B5: the cap is RETELL_BOOTSTRAP_MAX_PAGES CONTIGUOUS stored pages
+    # of one attempt — with no restart in the way, the tenth fires it.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    fake_table[pid] = _FakeRow(id=pid, poll_state={})
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+
+    fired = _drive_bootstrap_pages(
+        fake_table, monkeypatch, pid, now, op.RETELL_BOOTSTRAP_MAX_PAGES, prefix="p"
+    )
+
+    assert fired == [False] * (op.RETELL_BOOTSTRAP_MAX_PAGES - 1) + [True]
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+
+
+def test_bootstrap_cap_does_not_count_pages_replayed_after_a_restart(
+    fake_table, monkeypatch
+):
+    # v1.15 B5 (the second half of P1-B): a restart re-lists the bootstrap from
+    # page 1, so the pages it replays cover history the earlier attempt already
+    # covered. Counting them toward the cap would end the bootstrap after far
+    # fewer than RETELL_BOOTSTRAP_MAX_PAGES distinct pages. Five pages, a
+    # restart, then ten: the cap must fire on the TENTH of the new attempt.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    fake_table[pid] = _FakeRow(id=pid, poll_state={})
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+
+    assert (
+        _drive_bootstrap_pages(fake_table, monkeypatch, pid, now, 5, prefix="a")
+        == [False] * 5
+    )
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", _reject_all)
     _freeze_now(monkeypatch, now)
-    provider = _retell_provider(fake_table[pid])
-    op._poll_retell_provider(provider)
-    window = fake_table[pid].poll_state["retell"]["window"]
-    assert window["pages_stored"] == 0  # reset by the restart
-    assert window["total_pages"] == op.RETELL_BOOTSTRAP_MAX_PAGES - 1  # NOT reset
+    assert op._poll_retell_provider(_retell_provider(fake_table[pid])) is None
+    assert fake_table[pid].poll_state["retell"]["window"]["pages_stored"] == 0
 
-    # One more stored page reaches the cap (counting across the restart, not
-    # from the post-restart pages_stored=0), so this run must complete.
+    fired = _drive_bootstrap_pages(
+        fake_table, monkeypatch, pid, now, op.RETELL_BOOTSTRAP_MAX_PAGES, prefix="b"
+    )
+
+    # Under the deleted `total_pages` rule the 5th page here (5 replayed + 5)
+    # would have capped the bootstrap instead.
+    assert fired == [False] * (op.RETELL_BOOTSTRAP_MAX_PAGES - 1) + [True]
+    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
+
+
+def test_bootstrap_stuck_keeps_the_window_backs_off_and_never_advances(
+    fake_table, monkeypatch
+):
+    # v1.15 B6: cursor rejected every time, then offset mode rejected too.
+    # v1.14 completed the bootstrap here, advancing the watermark over history
+    # it had never covered; the bootstrap must instead be kept and retried.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    fake_table[pid] = _FakeRow(id=pid, poll_state={})
+    frozen_end = now - op.RETELL_VISIBILITY_LAG
+
+    with capture_logs() as cap:
+        _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, now)
+
+    state = fake_table[pid].poll_state["retell"]
+    assert "bootstrapped" not in state
+    assert fake_table[pid].last_fetched_at is None  # watermark untouched
+    assert state["bootstrap_stuck"] == 1
+    assert op._parse(state["backoff_until"]) == now + op._backoff_delay(1)
+    window = state["window"]
+    assert op._parse(window["end"]) == frozen_end  # the SAME frozen end is kept
+    assert window["key"] is None and window["skip"] is None  # fresh cursor attempt
+    assert window["pages_stored"] == 0 and window["restarts"] == 0
+    assert window["digests"] == [] and window["progress"] == 0
+    assert {
+        "event": "retell_bootstrap_stuck",
+        "log_level": "error",
+        "provider_id": str(pid),
+        "stuck_runs": 1,
+        "backoff_until": state["backoff_until"],
+    } in cap
+    # B8: a bootstrap window no longer reports retell_window_stuck.
+    assert not [e for e in cap if e["event"] == "retell_window_stuck"]
+
+
+def test_run_inside_the_bootstrap_stuck_backoff_is_skipped(fake_table, monkeypatch):
+    # v1.15 B6: the escalating backoff is what keeps a broken bootstrap from
+    # spinning; the ordinary backoff gate has to honour it.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    fake_table[pid] = _FakeRow(id=pid, poll_state={})
+    _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, now)
+
+    fetches = []
     monkeypatch.setattr(
         op.ObservabilityService,
         "fetch_retell_page",
-        lambda *a, **k: _page(_calls(1, "last"), has_more=True, next_key="k-last"),
+        lambda *a, **k: fetches.append(1) or _page(),
     )
-    _freeze_now_then_over_budget(monkeypatch, now)
-    provider = _retell_provider(fake_table[pid])
+    _freeze_now(monkeypatch, now + timedelta(minutes=1))
     with capture_logs() as cap:
-        outcome = op._poll_retell_provider(provider)
+        result = op._poll_retell_provider(_retell_provider(fake_table[pid]))
 
-    assert outcome == op.StoreOutcome(1, 0, 0)
-    assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
-    # F7/N8: pages_stored alone would misleadingly read 1 here (reset by the
-    # restart above) — total_pages is the field that actually reached the cap.
-    capped_events = [e for e in cap if e["event"] == "retell_bootstrap_capped"]
-    assert len(capped_events) == 1
-    assert capped_events[0]["pages_stored"] == 1
-    assert capped_events[0]["total_pages"] == op.RETELL_BOOTSTRAP_MAX_PAGES
+    assert result == op.StoreOutcome(0, 0, 0)
+    assert fetches == []
+    assert [e["event"] for e in cap] == ["retell_poll_backoff"]
 
 
-def test_bootstrap_permanently_broken_pagination_terminates_with_marker_and_first_run_end(
+def test_bootstrap_resumes_after_the_backoff_and_completes_with_the_original_end(
     fake_table, monkeypatch
 ):
-    # F1/H1: cursor rejected on every page, then offset mode also rejected —
-    # under v1.13 this looped `retell_window_stuck` forever with no marker
-    # ever set (the escalated bug the amendment review flagged). The fix must
-    # terminate the bootstrap instead, with the watermark equal to the FIRST
-    # run's frozen end, not left unset.
+    # v1.15 B6: when Retell's pagination recovers, the SAME bootstrap window
+    # finishes — with the end frozen on its very first run, so the first
+    # ordinary window covers everything after it and nothing is skipped.
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
-    row = _FakeRow(id=pid, poll_state={})
-    fake_table[pid] = row
-    _freeze_now(monkeypatch, now)
-    first_run_end = now - op.RETELL_VISIBILITY_LAG
+    fake_table[pid] = _FakeRow(id=pid, poll_state={})
+    original_end = now - op.RETELL_VISIBILITY_LAG
+    _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, now)
 
-    def raise_rejected(*a, **k):
-        raise RetellCursorRejected(cause="missing_key")
+    later = now + op._backoff_delay(1) + timedelta(seconds=1)
+    _freeze_now(monkeypatch, later)
+    seen = []
 
-    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", raise_rejected)
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
+        seen.append((start, end, pagination_key, skip))
+        return _page(_calls(1, "recovered"), has_more=False)
 
-    # F5/N9: advance the clock between simulated runs by more than
-    # RETELL_VISIBILITY_LAG. The window's "end" is frozen on the FIRST run
-    # and must never change; without this advance every run shares the same
-    # `now`, so "complete with the frozen window['end']" and "complete with
-    # THIS run's end" are the same instant and a mutant swapping one for the
-    # other (R1 mutant 3b) would pass undetected.
-    clock = {"now": now}
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
 
-    def _tick():
-        clock["now"] += op.RETELL_VISIBILITY_LAG * 5
-        _freeze_now(monkeypatch, clock["now"])
+    outcome = op._poll_retell_provider(_retell_provider(fake_table[pid]))
 
-    # RETELL_MAX_WINDOW_RESTARTS cursor-mode restarts -> switches to offset mode.
-    for _ in range(op.RETELL_MAX_WINDOW_RESTARTS):
-        provider = _retell_provider(fake_table[pid])
-        assert op._poll_retell_provider(provider) is None
-        _tick()
-    window = fake_table[pid].poll_state["retell"]["window"]
-    assert window["skip"] == 0  # now in offset mode
-
-    # RETELL_MAX_WINDOW_RESTARTS more (offset-mode) restarts, still rejected
-    # every time -> must terminate the bootstrap on the last one instead of
-    # looping "stuck" forever.
-    with capture_logs() as cap:
-        for _ in range(op.RETELL_MAX_WINDOW_RESTARTS - 1):
-            provider = _retell_provider(fake_table[pid])
-            assert op._poll_retell_provider(provider) is None
-            _tick()
-        provider = _retell_provider(fake_table[pid])
-        result = op._poll_retell_provider(provider)
-
-    assert result is None
+    assert outcome == op.StoreOutcome(1, 0, 0)
+    assert seen == [(None, original_end, None, None)]  # same window, cursor mode
     assert fake_table[pid].poll_state["retell"] == {"bootstrapped": True}
-    assert fake_table[pid].last_fetched_at == first_run_end
-    assert {
-        "event": "retell_window_stuck",
-        "log_level": "error",
-        "provider_id": str(pid),
-    } in cap
+    assert fake_table[pid].last_fetched_at == original_end
+
+
+def test_second_bootstrap_stuck_cycle_escalates_the_backoff(fake_table, monkeypatch):
+    # v1.15 B6: `bootstrap_stuck` is cleared only by completion, so repeated
+    # cycles keep escalating instead of retrying every 10 minutes forever.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    fake_table[pid] = _FakeRow(id=pid, poll_state={})
+    _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, now)
+
+    later = now + op._backoff_delay(1) + timedelta(seconds=1)
+    _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, later)
+
+    state = fake_table[pid].poll_state["retell"]
+    assert state["bootstrap_stuck"] == 2
+    assert op._parse(state["backoff_until"]) == later + op._backoff_delay(2)
+    assert op._backoff_delay(2) > op._backoff_delay(1)
+
+
+def test_a_stored_page_between_stuck_cycles_does_not_reset_bootstrap_stuck(
+    fake_table, monkeypatch
+):
+    # v1.15 B6: the successful-page `state.pop("total_failures")` must not take
+    # `bootstrap_stuck` with it — a bootstrap that limps one page forward per
+    # cycle must still escalate.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    fake_table[pid] = _FakeRow(id=pid, poll_state={})
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+    _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, now)
+
+    later = now + op._backoff_delay(1) + timedelta(seconds=1)
+    _drive_bootstrap_pages(fake_table, monkeypatch, pid, later, 1, prefix="ok")
+    state = fake_table[pid].poll_state["retell"]
+    assert state["bootstrap_stuck"] == 1  # survived a successful page
+    assert "backoff_until" not in state  # but the backoff itself was cleared
+
+    _drive_bootstrap_to_stuck(fake_table, monkeypatch, pid, later)
+    assert fake_table[pid].poll_state["retell"]["bootstrap_stuck"] == 2
 
 
 def test_bootstrap_cursor_rejected_three_times_switches_to_offset_mode(
@@ -1072,11 +1109,13 @@ def test_large_page_checkpoints_before_returning_then_resumes_from_cursor(
     # returning. Simulating "this one (slow) page alone used the whole
     # budget" is the faithful way to keep proving the checkpoint-then-return
     # property C3 asks for.
-    _freeze_now_then_over_budget(monkeypatch, now)
+    _freeze_now_then_over_budget(
+        monkeypatch, now, calls_per_page=op.RETELL_LIST_PAGE_LIMIT
+    )
 
     fetch_calls = []
 
-    def slow_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def slow_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         fetch_calls.append((start, end, pagination_key, skip))
         return _page(
             _calls(op.RETELL_LIST_PAGE_LIMIT, "big"),
@@ -1085,11 +1124,7 @@ def test_large_page_checkpoints_before_returning_then_resumes_from_cursor(
         )
 
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", slow_fetch)
-    monkeypatch.setattr(
-        op,
-        "process_and_store_logs",
-        lambda *a, **k: op.StoreOutcome(op.RETELL_LIST_PAGE_LIMIT, 0, 0),
-    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
 
     provider = _retell_provider(row)
     outcome = op._poll_retell_provider(provider)
@@ -1104,7 +1139,9 @@ def test_large_page_checkpoints_before_returning_then_resumes_from_cursor(
     )  # not advanced: the window isn't complete
 
     # A second run resumes from the persisted cursor rather than re-listing.
-    _freeze_now_then_over_budget(monkeypatch, now)
+    _freeze_now_then_over_budget(
+        monkeypatch, now, calls_per_page=op.RETELL_LIST_PAGE_LIMIT
+    )
     provider = _retell_provider(fake_table[pid])
     op._poll_retell_provider(provider)
 
@@ -1143,7 +1180,7 @@ def test_run_budget_pages_through_multiple_pages_within_one_run_when_clock_never
     ]
     fetch_calls = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         fetch_calls.append(pagination_key)
         return pages[len(fetch_calls) - 1]
 
@@ -1188,7 +1225,7 @@ def test_run_budget_exceeded_after_one_page_returns_with_cursor_persisted(
     _freeze_now_then_over_budget(monkeypatch, now)
     fetch_calls = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         fetch_calls.append(pagination_key)
         return _page(
             _calls(1, f"p{len(fetch_calls)}"),
@@ -1225,6 +1262,9 @@ def test_deadline_in_the_past_stores_at_most_one_page_and_persists_cursor(
     # must behave like the run budget already being exhausted — one page
     # stored and checkpointed, then return, even though the clock never
     # advances and `has_more` stays True.
+    # The full page IS stored here only because the fetcher is mocked: the real
+    # one is handed the same elapsed deadline and would submit nothing, so this
+    # pins the page LOOP's exit, not what a real run would store (v1.15.1 F7).
     pid = uuid.uuid4()
     now = _dt(2026, 1, 1, 12, 0, 0)
     wm = now - timedelta(hours=1)
@@ -1239,7 +1279,7 @@ def test_deadline_in_the_past_stores_at_most_one_page_and_persists_cursor(
 
     fetch_calls = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         fetch_calls.append(pagination_key)
         return _page(
             _calls(1, f"p{len(fetch_calls)}"),
@@ -1282,7 +1322,7 @@ def test_deadline_far_away_leaves_multi_page_run_unchanged(fake_table, monkeypat
     ]
     fetch_calls = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         fetch_calls.append(pagination_key)
         return pages[len(fetch_calls) - 1]
 
@@ -1312,7 +1352,7 @@ def test_deadline_none_means_only_the_run_budget_applies(fake_table, monkeypatch
     _freeze_now_then_over_budget(monkeypatch, now)
     fetch_calls = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         fetch_calls.append(pagination_key)
         return _page(
             _calls(1, f"p{len(fetch_calls)}"),
@@ -1394,7 +1434,7 @@ def test_behind_events_read_a_fresh_clock_not_the_run_start(fake_table, monkeypa
     ]
     fetch_calls = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         clock["t"] = clock["t"] + step  # each page takes `step` of wall time
         fetch_calls.append(pagination_key)
         return pages[len(fetch_calls) - 1]
@@ -1418,6 +1458,966 @@ def test_behind_events_read_a_fresh_clock_not_the_run_start(fake_table, monkeypa
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Call-level checkpoints (amendment v1.15): the deadline reaches INSIDE a page
+# --------------------------------------------------------------------------
+
+
+def _windowed_row(pid, now, window=None):
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=now - timedelta(minutes=30),
+        poll_state={
+            "retell": {"bootstrapped": True, **({"window": window} if window else {})}
+        },
+    )
+    return row
+
+
+def _in_progress_window(
+    now, *, key="cursor-1", progress=0, page_digest=None, counts=None
+):
+    return {
+        "start": (now - timedelta(minutes=30)).isoformat(),
+        "end": (now - op.RETELL_VISIBILITY_LAG).isoformat(),
+        "opened_at_hint": False,
+        "narrowed": False,
+        "key": key,
+        "skip": None,
+        "pages_stored": 1,
+        "digests": [],
+        "restarts": 0,
+        "progress": progress,
+        "page_digest": page_digest,
+        "page_counts": counts or [0, 0, 0, 0, 0, 0],
+    }
+
+
+def test_a_page_whose_stores_outlive_the_budget_checkpoints_and_resumes_mid_page(
+    fake_table, monkeypatch
+):
+    # The reviewer's P1-A regression. A full page's stores can outlive the run
+    # deadline; before v1.15 the cursor was written only after the whole page,
+    # so the activity was killed mid-page and the next tick re-listed and
+    # re-stored the same page forever. The run must now checkpoint at the call
+    # it reached and the next run must pick the page up there.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)
+    fake_table[pid] = row
+    stop_after = 40
+    all_calls = _calls(op.RETELL_LIST_PAGE_LIMIT, "big")
+    digest = _retell_page_digest(all_calls)
+
+    clock = {"t": now}
+    stores = {"n": 0}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    def slow_store(logs, *a, **k):
+        stores["n"] += 1
+        if stores["n"] == stop_after:  # this call is the one that ran us out of time
+            clock["t"] = now + op.RETELL_RUN_BUDGET + timedelta(seconds=1)
+        return op.StoreOutcome(len(logs), 0, 0)
+
+    monkeypatch.setattr(op, "process_and_store_logs", slow_store)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(all_calls, has_more=True, next_key="cursor-2"),
+    )
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(_retell_provider(row))
+
+    assert outcome == op.StoreOutcome(stop_after, 0, 0)  # THIS run's stores
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["progress"] == stop_after
+    assert window["page_digest"] == digest
+    assert window["page_counts"] == [stop_after, 0, 0, 0, 0, 0]
+    assert window["key"] is None  # cursor NOT advanced: the page is unfinished
+    assert window["pages_stored"] == 0  # nor does an unfinished page count
+    assert window["digests"] == []  # only a COMPLETE page is remembered
+    assert fake_table[pid].last_fetched_at == now - timedelta(minutes=30)
+    assert {
+        "event": "retell_page_checkpointed",
+        "log_level": "info",
+        "provider_id": str(pid),
+        "progress": stop_after,
+        "listed": op.RETELL_LIST_PAGE_LIMIT,
+    } in cap
+    assert not [e for e in cap if e["event"] == "retell_poll_counts"]  # page unfinished
+
+    # Next run: the same page, resumed where it stopped.
+    clock["t"] = now + timedelta(minutes=10)
+    seen = []
+
+    def resume_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
+        seen.append((pagination_key, kwargs["resume_from"], kwargs["resume_digest"]))
+        return _page(
+            all_calls[stop_after:],
+            has_more=False,
+            digest=digest,
+            listed=op.RETELL_LIST_PAGE_LIMIT,
+            consumed=op.RETELL_LIST_PAGE_LIMIT,
+            indices=range(stop_after, op.RETELL_LIST_PAGE_LIMIT),
+        )
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", resume_fetch)
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(_retell_provider(fake_table[pid]))
+
+    assert seen == [(None, stop_after, digest)]
+    assert outcome == op.StoreOutcome(op.RETELL_LIST_PAGE_LIMIT, 0, 0)  # page total
+    counts = [e for e in cap if e["event"] == "retell_poll_counts"]
+    assert len(counts) == 1 and counts[0]["stored"] == op.RETELL_LIST_PAGE_LIMIT
+    assert not [e for e in cap if e["event"] == "retell_window_restarted"]  # no repeat
+    assert "window" not in fake_table[pid].poll_state["retell"]  # completed and popped
+    assert fake_table[pid].last_fetched_at == now - op.RETELL_VISIBILITY_LAG
+
+
+def test_a_hydration_truncated_page_checkpoints_at_consumed(fake_table, monkeypatch):
+    # v1.15 A3/B5: the fetcher itself can stop at the deadline part-way through
+    # a page. Everything it did return is stored, then the run checkpoints at
+    # `consumed` — not at the number of calls it happened to store.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)  # the budget never elapses: only `consumed` stops it
+    hydrated = _calls(6, "h")
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            hydrated, has_more=True, next_key="cursor-2", listed=10, consumed=6
+        ),
+    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(_retell_provider(row))
+
+    assert outcome == op.StoreOutcome(6, 0, 0)
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["progress"] == 6
+    assert window["page_digest"] == _retell_page_digest(hydrated)
+    assert window["key"] is None  # the page is not finished, the cursor stays
+    assert {
+        "event": "retell_page_checkpointed",
+        "log_level": "info",
+        "provider_id": str(pid),
+        "progress": 6,
+        "listed": 10,
+    } in cap
+
+
+def test_a_second_checkpoint_on_the_same_page_returns_the_pages_stores_so_far(
+    fake_table, monkeypatch
+):
+    # v1.15.2 F10: one meaning for both return paths — the current page's
+    # counts, whichever run stored them. The only caller reads None versus not
+    # None, so a second convention for the checkpoint bought nothing and cost a
+    # snapshot of `page_counts` on every page.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    page_calls = _calls(100, "two-stop")
+    digest = _retell_page_digest(page_calls)
+    window = _in_progress_window(
+        now, key=None, progress=40, page_digest=digest, counts=[40, 0, 0, 0, 0, 0]
+    )
+    row = _windowed_row(pid, now, window)
+    fake_table[pid] = row
+
+    clock = {"t": now}
+    stores = {"n": 0}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    def slow_store(logs, *a, **k):
+        stores["n"] += 1
+        if stores["n"] == 10:
+            clock["t"] = now + op.RETELL_RUN_BUDGET + timedelta(seconds=1)
+        return op.StoreOutcome(len(logs), 0, 0)
+
+    monkeypatch.setattr(op, "process_and_store_logs", slow_store)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            page_calls[40:],
+            has_more=True,
+            next_key="cursor-2",
+            digest=digest,
+            listed=100,
+            indices=range(40, 100),
+        ),
+    )
+
+    outcome = op._poll_retell_provider(_retell_provider(row))
+
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["progress"] == 50
+    assert window["page_counts"] == [50, 0, 0, 0, 0, 0]  # the page's running total
+    assert outcome == op.StoreOutcome(50, 0, 0)  # which is what the run returns
+    assert outcome != op.StoreOutcome(10, 0, 0)  # not the 10 this run stored
+
+
+def test_the_next_page_in_the_same_run_starts_from_zero_progress(
+    fake_table, monkeypatch
+):
+    # v1.15 B1: the progress keys describe the page the cursor points at, so
+    # advancing the cursor must clear them. Carried over, the next page would
+    # be asked to resume at an offset that means nothing on it — and would
+    # report a spurious `retell_page_changed` when its digest did not match.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    page_one = _calls(10, "one")
+    window = _in_progress_window(
+        now,
+        key=None,
+        progress=4,
+        page_digest=_retell_page_digest(page_one),
+        counts=[4, 0, 0, 0, 0, 0],
+    )
+    row = _windowed_row(pid, now, window)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)  # both pages fit in one run
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+    seen = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
+        seen.append((kwargs["resume_from"], kwargs["resume_digest"]))
+        if len(seen) == 1:
+            return _page(
+                page_one[4:],
+                has_more=True,
+                next_key="cursor-2",
+                digest=_retell_page_digest(page_one),
+                listed=10,
+                indices=range(4, 10),
+            )
+        return _page(_calls(3, "two"), has_more=False)
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+
+    with capture_logs() as cap:
+        op._poll_retell_provider(_retell_provider(row))
+
+    assert seen[0] == (4, _retell_page_digest(page_one))  # page 1 resumed
+    assert seen[1] == (0, None)  # page 2 starts clean
+    assert not [e for e in cap if e["event"] == "retell_page_changed"]
+
+
+def test_a_resumed_page_that_changed_is_re_stored_from_zero(fake_table, monkeypatch):
+    # v1.15 B3: the page under the cursor changed between runs, so the progress
+    # into the old one means nothing. Re-store it whole — a re-emit is cheap and
+    # idempotent, a skipped call is silent loss.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    window = _in_progress_window(now, key=None, progress=3, page_digest="an-older-page")
+    row = _windowed_row(pid, now, window)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    fresh = _calls(5, "fresh")
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(fresh, has_more=False),
+    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(_retell_provider(row))
+
+    assert outcome == op.StoreOutcome(5, 0, 0)  # all five, not just the last two
+    assert {
+        "event": "retell_page_changed",
+        "log_level": "warning",
+        "provider_id": str(pid),
+        "progress": 3,
+    } in cap
+    assert "window" not in fake_table[pid].poll_state["retell"]
+
+
+def test_a_second_page_change_only_warns_and_still_re_stores_the_page(
+    fake_table, monkeypatch
+):
+    # v1.15.2 F9: one page changing under a resume is ordinary (Retell may have
+    # been listing while a call ended), so it stays a warning and the page is
+    # re-stored. Only the counter is new — and it has to survive a run that did
+    # not complete the page, or a repeating mismatch could never add up.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    window = _in_progress_window(now, key=None, progress=3, page_digest="an-older-page")
+    row = _windowed_row(pid, now, window)
+    row.poll_state["retell"]["page_changed"] = 1
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(5, "fresh"), has_more=False),
+    )
+    stored = []
+
+    def store(logs, *a, **k):  # one call fails to export: `partial`, so the
+        stored.extend(logs)  # page is retried and the run's state survives
+        return (
+            op.StoreOutcome(0, 0, 1) if len(stored) == 5 else op.StoreOutcome(1, 0, 0)
+        )
+
+    monkeypatch.setattr(op, "process_and_store_logs", store)
+
+    with capture_logs() as cap:
+        assert op._poll_retell_provider(_retell_provider(row)) is None
+
+    assert len(stored) == 5  # re-stored from 0, not resumed at 3
+    state = fake_table[pid].poll_state["retell"]
+    assert state["page_changed"] == 2
+    assert "backoff_until" not in state
+    assert [e["event"] for e in cap if e["event"].startswith("retell_page_")] == [
+        "retell_page_changed"
+    ]
+
+
+def test_a_third_page_change_in_a_row_backs_off_with_an_error_event(
+    fake_table, monkeypatch
+):
+    # v1.15.2 F9, the R2 Medium finding. A page that comes back in a new order
+    # every time it is listed re-stores its prefix and checkpoints again on
+    # every run, for ever: the cursor never advances, so the watermark never
+    # does either and `retell_poll_behind` — the event an operator alerts on —
+    # is never even reached. The third mismatch in a row is treated as the
+    # outage it is: back off, and say so at error level.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    window = _in_progress_window(now, key=None, progress=3, page_digest="an-older-page")
+    row = _windowed_row(pid, now, window)
+    row.poll_state["retell"]["page_changed"] = 2
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    stored = []
+
+    def store(logs, *a, **k):
+        stored.extend(logs)
+        return op.StoreOutcome(len(logs), 0, 0)
+
+    monkeypatch.setattr(op, "process_and_store_logs", store)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(5, "fresh"), has_more=False),
+    )
+
+    with capture_logs() as cap:
+        assert op._poll_retell_provider(_retell_provider(row)) is None
+
+    assert stored == []  # the run stops at the mismatch instead of re-storing
+    state = fake_table[pid].poll_state["retell"]
+    assert state["page_changed"] == 3
+    assert state["total_failures"] == 1
+    assert state["backoff_until"] == (now + op._backoff_delay(1)).isoformat()
+    assert state["window"]["progress"] == 0
+    assert state["window"]["page_digest"] is None
+    assert state["window"]["key"] is None  # the cursor is where it was
+    assert [e for e in cap if e["event"] == "retell_page_unstable"] == [
+        {
+            "event": "retell_page_unstable",
+            "log_level": "error",
+            "provider_id": str(pid),
+            "page_changed": 3,
+            "backoff_until": state["backoff_until"],
+        }
+    ]
+    assert not [e for e in cap if e["event"] == "retell_page_changed"]
+
+
+def test_a_completed_page_clears_the_page_changed_counter(fake_table, monkeypatch):
+    # v1.15.2 F9: only mismatches IN A ROW say the listing itself is unusable.
+    # A page that resumes against its own digest and completes proves the
+    # opposite, so the count of changes that preceded it must not be carried
+    # into some later, unrelated page's first wobble.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    page_calls = _calls(5, "steady")
+    digest = _retell_page_digest(page_calls)
+    window = _in_progress_window(
+        now, key=None, progress=2, page_digest=digest, counts=[2, 0, 0, 0, 0, 0]
+    )
+    row = _windowed_row(pid, now, window)
+    row.poll_state["retell"]["page_changed"] = 2
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            page_calls[2:], has_more=False, digest=digest, listed=5, indices=range(2, 5)
+        ),
+    )
+
+    with capture_logs() as cap:
+        assert op._poll_retell_provider(_retell_provider(row)) == op.StoreOutcome(
+            5, 0, 0
+        )
+
+    assert not [e for e in cap if e["event"] == "retell_page_unstable"]
+    assert "page_changed" not in fake_table[pid].poll_state["retell"]
+
+
+def test_a_partial_verdict_retry_resets_the_page_progress(fake_table, monkeypatch):
+    # v1.15 B5: a `partial` page is retried whole next run, so the progress and
+    # the counts of the attempt that failed must not survive into it.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    page_calls = _calls(5, "part")
+    digest = _retell_page_digest(page_calls)
+    window = _in_progress_window(
+        now, key=None, progress=2, page_digest=digest, counts=[2, 0, 0, 0, 0, 0]
+    )
+    row = _windowed_row(pid, now, window)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            page_calls[2:], has_more=False, digest=digest, listed=5, indices=range(2, 5)
+        ),
+    )
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 1)
+    )
+
+    assert op._poll_retell_provider(_retell_provider(row)) is None
+
+    state = fake_table[pid].poll_state["retell"]
+    assert state["failed_runs"] == 1
+    window = state["window"]
+    assert window["progress"] == 0
+    assert window["page_digest"] is None
+    assert window["page_counts"] == [0, 0, 0, 0, 0, 0]
+
+
+def test_a_total_verdict_also_resets_the_page_progress(fake_table, monkeypatch):
+    # Deviation from v1.15 B5, which names the reset only for `partial`: a
+    # `total` page is likewise retried whole. Were its progress kept, the next
+    # run would resume past every call, store nothing, re-classify the same
+    # all-failed counts as `total` again and escalate the backoff for ever
+    # without ever retrying a single call.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    seen = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
+        seen.append(kwargs["resume_from"])
+        return _page(_calls(3, "t"), has_more=False, listed=4, drops=((3, 5),))
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(
+        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 0, 1)
+    )
+
+    with capture_logs() as cap:
+        assert op._poll_retell_provider(_retell_provider(row)) is None
+
+    # v1.15.2 F11: the one event that says WHY the backoff started must carry
+    # the failed page's own numbers. `_reset_page_progress` runs before
+    # `_on_total_failure` logs them, so it has to rebind `page_counts` — were it
+    # to clear the list in place, this event would report an all-zero page.
+    incomplete = [e for e in cap if e["event"] == "retell_store_incomplete"]
+    assert len(incomplete) == 1
+    assert incomplete[0]["stored"] == 0
+    assert incomplete[0]["export_failed"] == 3
+    assert incomplete[0]["dropped_failed"] == 1
+
+    state = fake_table[pid].poll_state["retell"]
+    assert state["total_failures"] == 1
+    window = state["window"]
+    assert window["progress"] == 0
+    assert window["page_counts"] == [0, 0, 0, 0, 0, 0]
+
+    # The next run (after the backoff) re-lists and re-stores the page from 0.
+    _freeze_now(monkeypatch, now + op._backoff_delay(1) + timedelta(seconds=1))
+    op._poll_retell_provider(_retell_provider(fake_table[pid]))
+    assert seen == [0, 0]
+
+
+def test_the_activity_deadline_also_stops_inside_a_page(fake_table, monkeypatch):
+    # v1.15 B2: `run_deadline` is min(run budget, activity deadline), and it is
+    # the value the store loop checks — so the fan-out's deadline bounds a page
+    # from the inside too, not just the page loop from the outside.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)  # the run budget alone would never fire
+    seen_deadline = []
+
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
+        seen_deadline.append(kwargs["deadline"])
+        return _page(_calls(5, "d"), has_more=True, next_key="cursor-2")
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+
+    activity_deadline = now - timedelta(minutes=1)
+    outcome = op._poll_retell_provider(
+        _retell_provider(row), deadline=activity_deadline
+    )
+
+    assert seen_deadline == [activity_deadline]  # narrowed past the run budget
+    assert outcome == op.StoreOutcome(1, 0, 0)  # stopped after the first call
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["progress"] == 1
+    assert window["key"] is None
+
+
+def test_drops_before_a_checkpoint_still_make_the_completed_page_partial(
+    fake_table, monkeypatch
+):
+    # v1.15.1 F1, the R1 High finding. A resumed response only describes the
+    # slice it hydrated, so the two 500s of the first run appear in no later
+    # response. Counted only there, they would vanish at the checkpoint: the
+    # page would complete as "ok", the cursor and the watermark would move past
+    # it, and two retryable calls would be excluded from every later window
+    # with nothing logged. The window must accumulate drops as it does stores.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    listed = _calls(10, "mix")
+    digest = _retell_page_digest(listed)
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+
+    # Run 1: hydration reached index 4 and two of those five calls failed 500x3.
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            [listed[0], listed[2], listed[4]],
+            has_more=False,
+            drops=((1, 5), (3, 5)),
+            digest=digest,
+            listed=10,
+            consumed=5,
+            indices=(0, 2, 4),
+        ),
+    )
+    assert op._poll_retell_provider(_retell_provider(row)) == op.StoreOutcome(3, 0, 0)
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["progress"] == 5
+    assert window["page_counts"] == [3, 0, 0, 0, 0, 2]  # the drops are remembered
+
+    # Run 2: the tail hydrates cleanly, so this response drops nothing.
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            listed[5:],
+            has_more=False,
+            digest=digest,
+            listed=10,
+            consumed=10,
+            indices=range(5, 10),
+        ),
+    )
+    with capture_logs() as cap:
+        assert op._poll_retell_provider(_retell_provider(fake_table[pid])) is None
+
+    counts = [e for e in cap if e["event"] == "retell_poll_counts"]
+    assert len(counts) == 1
+    assert counts[0]["stored"] == 8
+    assert counts[0]["dropped_failed"] == 2  # the PAGE's total, not the last slice
+    incomplete = [e for e in cap if e["event"] == "retell_store_incomplete"]
+    assert len(incomplete) == 1 and incomplete[0]["dropped_failed"] == 2
+    state = fake_table[pid].poll_state["retell"]
+    assert state["failed_runs"] == 1  # `partial`: the page is retried
+    assert state["window"]["progress"] == 0  # and retried whole
+    assert state["window"]["page_counts"] == [0, 0, 0, 0, 0, 0]
+    assert fake_table[pid].last_fetched_at == now - timedelta(minutes=30)
+
+
+def test_drops_past_a_mid_loop_checkpoint_are_counted_once_not_twice(
+    fake_table, monkeypatch
+):
+    # v1.15.2 F8, the R2 High finding. The window's counts must cover exactly
+    # what `progress` covers. A mid-loop checkpoint stops `progress` at the call
+    # the deadline landed on, while the response that arrived had already
+    # decided the fate of items far past it — and the next run, resuming at
+    # `progress`, is told about those same drops again. Counted when the
+    # response arrives, they land in the window twice: here that turns
+    # `dropped_failed=6` on a page of 10 malformed calls into 12, which is the
+    # difference between `partial` (retry the page, keep polling) and `total`
+    # (an escalating backoff and no live calls for this provider for hours).
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)
+    fake_table[pid] = row
+    listed = _calls(16, "r2")
+    digest = _retell_page_digest(listed)
+    # 0 and 2-9 hydrated; 1 and 10-15 failed 500x3, so the page really drops
+    # seven. The drop at index 1 sits exactly on the checkpoint boundary
+    # (progress == 1 after the first store): counted with `<=` it would be
+    # counted again on the resume, which is the R2 High one drop at a time.
+    failed = ((1, 5),) + tuple((index, 5) for index in range(10, 16))
+    hydrated = listed[:1] + listed[2:10]
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            hydrated,
+            has_more=False,
+            drops=failed,
+            digest=digest,
+            listed=16,
+            consumed=16,
+            indices=(0, *range(2, 10)),
+        ),
+    )
+
+    clock = {"t": now}
+    stores = {"n": 0}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    def slow_store(logs, *a, **k):  # every call stores malformed
+        stores["n"] += 1
+        if stores["n"] == 1:  # the deadline goes during the first store
+            clock["t"] = now + op.RETELL_RUN_BUDGET + timedelta(seconds=1)
+        return op.StoreOutcome(0, len(logs), 0)
+
+    monkeypatch.setattr(op, "process_and_store_logs", slow_store)
+
+    assert op._poll_retell_provider(_retell_provider(row)) == op.StoreOutcome(0, 1, 0)
+    window = fake_table[pid].poll_state["retell"]["window"]
+    assert window["progress"] == 1
+    # Not one of the seven is behind the checkpoint, so not one is counted yet.
+    assert window["page_counts"] == [0, 1, 0, 0, 0, 0]
+
+    # Run 2 resumes at 1, is told about the same seven drops, and completes.
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            listed[2:10],
+            has_more=False,
+            drops=failed,
+            digest=digest,
+            listed=16,
+            consumed=16,
+            indices=range(2, 10),
+        ),
+    )
+    with capture_logs() as cap:
+        assert op._poll_retell_provider(_retell_provider(fake_table[pid])) is None
+
+    counts = [e for e in cap if e["event"] == "retell_poll_counts"]
+    assert len(counts) == 1
+    assert counts[0]["malformed"] == 9 and counts[0]["stored"] == 0
+    assert counts[0]["dropped_failed"] == 7  # the page's seven, not fourteen
+    state = fake_table[pid].poll_state["retell"]
+    assert state["failed_runs"] == 1  # `partial`: the page is retried
+    assert "total_failures" not in state and "backoff_until" not in state
+
+
+def test_a_page_hydrated_to_zero_neither_writes_state_nor_logs_a_checkpoint(
+    fake_table, monkeypatch
+):
+    # v1.15.1 F7: the deadline went during the list request, so hydration
+    # submitted nothing. There is no progress, no page identity and no count to
+    # remember — writing state and announcing a checkpoint would report a run
+    # that learned nothing, and the next run re-lists this page from 0 anyway.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            [],
+            has_more=True,
+            next_key="cursor-2",
+            digest=_retell_page_digest(_calls(10, "unseen")),
+            listed=10,
+            consumed=0,
+            indices=(),
+        ),
+    )
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(
+            _retell_provider(row), deadline=now - timedelta(minutes=1)
+        )
+
+    assert outcome == op.StoreOutcome(0, 0, 0)
+    assert not [e for e in cap if e["event"] == "retell_page_checkpointed"]
+    assert "window" not in fake_table[pid].poll_state["retell"]  # nothing written
+
+
+def test_a_mismatch_on_a_spent_deadline_is_still_counted(fake_table, monkeypatch):
+    # The one path where a page is both unstable and making no progress: the
+    # digest mismatches and the deadline went during the list request. The
+    # "nothing learned" shortcut must not swallow the mismatch count, or such
+    # a page could log a warning every run and never reach the backoff.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    window = _in_progress_window(
+        now, progress=3, page_digest="old", counts=[3, 0, 0, 0, 0, 0]
+    )
+    row = _windowed_row(pid, now, window)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            [],
+            has_more=True,
+            next_key="cursor-2",
+            digest="new",
+            listed=10,
+            consumed=0,
+            indices=(),
+        ),
+    )
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(
+            _retell_provider(row), deadline=now - timedelta(minutes=1)
+        )
+
+    assert outcome == op.StoreOutcome(0, 0, 0)
+    state = fake_table[pid].poll_state["retell"]
+    assert state["page_changed"] == 1  # persisted, not swallowed
+    assert state["window"]["progress"] == 0
+    assert state["window"]["page_digest"] == "new"
+    assert [e["event"] for e in cap if e["event"].startswith("retell_page_")] == [
+        "retell_page_changed",
+        "retell_page_checkpointed",
+    ]
+
+
+def test_a_checkpointing_run_still_raises_the_behind_alarm(fake_table, monkeypatch):
+    # A slow page is exactly when the frontier ages while the cursor stands
+    # still. If the alarm fired only on a cursor advance, a provider hours
+    # behind could checkpoint every tick for a day with nothing above info.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    behind = op.RETELL_WINDOW_HINT_MAX + op.RETELL_BEHIND_ERROR + timedelta(hours=1)
+    row = _FakeRow(
+        id=pid,
+        last_fetched_at=now - behind,
+        poll_state={"retell": {"bootstrapped": True}},
+    )
+    fake_table[pid] = row
+    clock = {"t": now}
+    stores = {"n": 0}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    def slow_store(logs, *a, **k):
+        stores["n"] += 1
+        if stores["n"] == 1:
+            clock["t"] = now + op.RETELL_RUN_BUDGET + timedelta(seconds=1)
+        return op.StoreOutcome(len(logs), 0, 0)
+
+    monkeypatch.setattr(op, "process_and_store_logs", slow_store)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(50, "slow"), has_more=True, next_key="cursor-2"),
+    )
+
+    with capture_logs() as cap:
+        op._poll_retell_provider(_retell_provider(row))
+
+    assert [e["event"] for e in cap if e["event"] == "retell_page_checkpointed"]
+    # the window opened at the hint, so its end is 7 h old by the checkpoint
+    window_end = now - behind + op.RETELL_WINDOW_HINT_MAX
+    assert [e for e in cap if e["event"] == "retell_poll_stalled"] == [
+        {
+            "event": "retell_poll_stalled",
+            "log_level": "error",
+            "provider_id": str(pid),
+            "frontier_age_seconds": int((clock["t"] - window_end).total_seconds()),
+            "pages_stored": 0,
+        }
+    ]
+
+
+def test_a_checkpoint_on_a_fresh_frontier_stays_quiet(fake_table, monkeypatch):
+    # The shared activity deadline can force a checkpoint on a window whose
+    # frontier is only a minute old; that is not "behind" and must not warn.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _windowed_row(pid, now)  # frontier 60 s old
+    fake_table[pid] = row
+    clock = {"t": now}
+    stores = {"n": 0}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    def slow_store(logs, *a, **k):
+        stores["n"] += 1
+        if stores["n"] == 1:
+            clock["t"] = now + timedelta(minutes=2)  # past the activity deadline
+        return op.StoreOutcome(len(logs), 0, 0)
+
+    monkeypatch.setattr(op, "process_and_store_logs", slow_store)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(50, "fresh"), has_more=True, next_key="cursor-2"),
+    )
+
+    with capture_logs() as cap:
+        op._poll_retell_provider(
+            _retell_provider(row), deadline=now + timedelta(minutes=1)
+        )
+
+    events = [e["event"] for e in cap]
+    assert "retell_page_checkpointed" in events
+    assert not {"retell_poll_behind", "retell_poll_stalled"} & set(events)
+
+
+def test_a_bootstrap_checkpoint_never_reports_behind(fake_table, monkeypatch):
+    # The bootstrap frontier is frozen by design; ageing is not "behind".
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    row = _FakeRow(id=pid, last_fetched_at=None, poll_state={})
+    fake_table[pid] = row
+    clock = {"t": now}
+    stores = {"n": 0}
+    monkeypatch.setattr(op.timezone, "now", lambda: clock["t"])
+
+    def slow_store(logs, *a, **k):
+        stores["n"] += 1
+        if stores["n"] == 1:
+            clock["t"] = now + op.RETELL_RUN_BUDGET + op.RETELL_BEHIND_ERROR
+        return op.StoreOutcome(len(logs), 0, 0)
+
+    monkeypatch.setattr(op, "process_and_store_logs", slow_store)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(_calls(50, "boot"), has_more=True, next_key="cursor-2"),
+    )
+
+    with capture_logs() as cap:
+        op._poll_retell_provider(_retell_provider(row))
+
+    events = [e["event"] for e in cap]
+    assert "retell_page_checkpointed" in events
+    assert not {"retell_poll_behind", "retell_poll_stalled"} & set(events)
+
+
+def test_a_restart_forgets_the_mismatches_of_the_page_it_abandons(
+    fake_table, monkeypatch
+):
+    # `page_changed` is per page: a window restart re-lists from page 1, so
+    # mismatches seen on the abandoned page must not count toward a later one.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    window = _in_progress_window(now, progress=3, page_digest="old")
+    row = _windowed_row(pid, now, window)
+    row.poll_state["retell"]["page_changed"] = 2
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+
+    def rejected(*a, **k):
+        raise op.RetellCursorRejected(cause="http_422")
+
+    monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", rejected)
+
+    assert op._poll_retell_provider(_retell_provider(row)) is None
+    state = fake_table[pid].poll_state["retell"]
+    assert "page_changed" not in state
+    assert state["window"]["restarts"] == 1
+
+
+@pytest.mark.parametrize("pages_stored", [1, 0])
+def test_an_empty_listing_on_a_resume_is_a_paging_fault_not_a_mismatch(
+    fake_table, monkeypatch, pages_stored
+):
+    # An empty page with has_more is judged before the digest comparison, so
+    # it restarts the window and is never scored as page instability. The
+    # pages_stored == 0 case is the ordinary first-page resume: nothing
+    # completed yet, but progress says paging is under way, and scoring the
+    # empty listing as a mismatch there would complete a phantom page and
+    # advance the cursor past calls that were never stored.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    window = _in_progress_window(now, progress=3, page_digest="old")
+    window["pages_stored"] = pages_stored
+    row = _windowed_row(pid, now, window)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(
+            [],
+            has_more=True,
+            next_key="k",
+            digest=None,
+            listed=0,
+            consumed=0,
+            indices=(),
+        ),
+    )
+
+    with capture_logs() as cap:
+        assert op._poll_retell_provider(_retell_provider(row)) is None
+
+    state = fake_table[pid].poll_state["retell"]
+    assert "page_changed" not in state
+    restarted = [e for e in cap if e["event"] == "retell_window_restarted"]
+    assert len(restarted) == 1 and restarted[0]["cause"] == "empty_page"
+    assert not [e for e in cap if e["event"] == "retell_page_changed"]
+
+
+def test_a_resumed_page_re_ordered_under_us_is_re_stored_from_zero(
+    fake_table, monkeypatch
+):
+    # v1.15.1 F2: the members are unchanged, only the order moved. The resume
+    # skips items [:2] by POSITION, so a digest blind to order would skip two
+    # calls that are no longer there and never store them.
+    pid = uuid.uuid4()
+    now = _dt(2026, 1, 1, 12, 0, 0)
+    page_calls = _calls(5, "shuf")
+    reordered = page_calls[3:] + page_calls[:3]
+    window = _in_progress_window(
+        now,
+        key=None,
+        progress=2,
+        page_digest=_retell_page_digest(page_calls),
+        counts=[2, 0, 0, 0, 0, 0],
+    )
+    row = _windowed_row(pid, now, window)
+    fake_table[pid] = row
+    _freeze_now(monkeypatch, now)
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
+    monkeypatch.setattr(
+        op.ObservabilityService,
+        "fetch_retell_page",
+        lambda *a, **k: _page(reordered, has_more=False),
+    )
+
+    with capture_logs() as cap:
+        outcome = op._poll_retell_provider(_retell_provider(row))
+
+    assert outcome == op.StoreOutcome(5, 0, 0)  # all five, not the last three
+    assert [e["event"] for e in cap if e["event"] == "retell_page_changed"] == [
+        "retell_page_changed"
+    ]
+
+
 # Mutation guards (v1.14 review fix F6)
 # --------------------------------------------------------------------------
 
@@ -1483,7 +2483,9 @@ def test_bootstrap_page_cap_check_never_applies_the_ordinary_window_guard(
         "key": "cursor-x",
         "skip": None,
         "pages_stored": op.RETELL_MAX_PAGES_PER_WINDOW,  # > the ORDINARY-window cap
-        "total_pages": op.RETELL_BOOTSTRAP_MAX_PAGES - 1,  # one below the BOOTSTRAP cap
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": [],
         "restarts": 0,
     }
@@ -1536,9 +2538,7 @@ def test_windowed_single_page_pops_window_and_advances_watermark(
         "fetch_retell_page",
         lambda *a, **k: _page(_calls(2), has_more=False),
     )
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(2, 0, 0)
-    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
 
     outcome = op._poll_retell_provider(provider)
     assert outcome == op.StoreOutcome(2, 0, 0)
@@ -1568,7 +2568,7 @@ def test_retell_page_all_malformed_logged_when_ok_verdict_has_zero_stored(
         lambda *a, **k: _page(_calls(5), has_more=False),
     )
     monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(0, 5, 0)
+        op, "process_and_store_logs", _store_each(stored=0, malformed=1)
     )
 
     with capture_logs() as cap:
@@ -1720,7 +2720,9 @@ def test_digest_history_caps_at_eight_evicts_oldest_newest_last(
         "key": "k8",
         "skip": None,
         "pages_stored": op.RETELL_DIGEST_HISTORY,
-        "total_pages": op.RETELL_DIGEST_HISTORY,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": list(old_digests),
         "restarts": 0,
     }
@@ -1745,7 +2747,7 @@ def test_digest_history_caps_at_eight_evicts_oldest_newest_last(
     op._poll_retell_provider(provider)
 
     new_digests = fake_table[pid].poll_state["retell"]["window"]["digests"]
-    expected_new_digest = op._page_digest(_calls(1, "fresh"))
+    expected_new_digest = _retell_page_digest(_calls(1, "fresh"))
     assert len(new_digests) == op.RETELL_DIGEST_HISTORY  # still capped, not 9
     assert new_digests[-1] == expected_new_digest  # newest last
     assert old_digests[0] not in new_digests  # oldest (index 0) evicted
@@ -1764,7 +2766,9 @@ def test_cursor_rejected_restarts_window_with_cause(fake_table, monkeypatch):
         "key": "stale",
         "skip": None,
         "pages_stored": 1,
-        "total_pages": 1,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": ["deadbeef"],
         "restarts": 0,
     }
@@ -1819,8 +2823,10 @@ def test_repeated_digest_restarts_window(fake_table, monkeypatch):
         "key": "k1",
         "skip": None,
         "pages_stored": 1,
-        "total_pages": 1,
-        "digests": [op._page_digest(_calls(1, "dup"))],
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
+        "digests": [_retell_page_digest(_calls(1, "dup"))],
         "restarts": 0,
     }
     row = _FakeRow(
@@ -1854,7 +2860,9 @@ def test_empty_page_with_has_more_after_first_page_restarts(fake_table, monkeypa
         "key": "k1",
         "skip": None,
         "pages_stored": 1,
-        "total_pages": 1,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": ["deadbeef"],
         "restarts": 0,
     }
@@ -1889,7 +2897,9 @@ def test_page_cap_restarts_window(fake_table, monkeypatch):
         "key": "k1",
         "skip": None,
         "pages_stored": op.RETELL_MAX_PAGES_PER_WINDOW - 1,
-        "total_pages": op.RETELL_MAX_PAGES_PER_WINDOW - 1,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": [],
         "restarts": 0,
     }
@@ -1934,7 +2944,9 @@ def test_three_restarts_halve_window_and_set_hint(fake_table, monkeypatch):
         "key": "k1",
         "skip": None,
         "pages_stored": 1,
-        "total_pages": 1,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": ["deadbeef"],
         "restarts": 2,
     }
@@ -1977,7 +2989,7 @@ def test_hint_caps_new_window_width(fake_table, monkeypatch):
     _freeze_now(monkeypatch, now)
     seen = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         seen.append((start, end))
         return _page(_calls(1), has_more=False)
 
@@ -2029,7 +3041,9 @@ def test_narrowed_window_one_page_result_does_not_grow_hint(fake_table, monkeypa
         "key": None,
         "skip": None,
         "pages_stored": 0,
-        "total_pages": 0,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": [],
         "restarts": 0,
     }
@@ -2183,7 +3197,9 @@ def test_multi_page_window_completed_by_cursor_drops_hint_entirely(
         "key": "k1",
         "skip": None,
         "pages_stored": 1,
-        "total_pages": 1,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": ["deadbeef"],
         "restarts": 0,
     }
@@ -2231,7 +3247,9 @@ def test_poll_behind_fires_on_completed_window_older_than_warn_threshold(
         "key": None,
         "skip": None,
         "pages_stored": 0,
-        "total_pages": 0,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": [],
         "restarts": 0,
     }
@@ -2423,7 +3441,9 @@ def test_window_at_min_width_falls_back_to_offset_mode(fake_table):
         "key": "k1",
         "skip": None,
         "pages_stored": 0,
-        "total_pages": 0,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": [],
         "restarts": 2,
     }  # about to hit the restart cap
@@ -2455,7 +3475,9 @@ def test_offset_mode_skip_increments_by_page_limit(fake_table, monkeypatch):
         "key": None,
         "skip": 0,
         "pages_stored": 0,
-        "total_pages": 0,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": [],
         "restarts": 0,
     }
@@ -2467,17 +3489,15 @@ def test_offset_mode_skip_increments_by_page_limit(fake_table, monkeypatch):
     fake_table[pid] = row
     provider = _retell_provider(row)
     # F2: identical content on every call — see _freeze_now_then_over_budget.
-    _freeze_now_then_over_budget(monkeypatch, now)
+    _freeze_now_then_over_budget(monkeypatch, now, calls_per_page=1000)
     seen_skip = []
 
-    def fake_fetch(prov, s, e, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, s, e, *, pagination_key=None, skip=None, **kwargs):
         seen_skip.append(skip)
         return _page(_calls(1000), has_more=True)
 
     monkeypatch.setattr(op.ObservabilityService, "fetch_retell_page", fake_fetch)
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1000, 0, 0)
-    )
+    monkeypatch.setattr(op, "process_and_store_logs", _store_each())
 
     op._poll_retell_provider(provider)
     assert seen_skip == [0]
@@ -2501,7 +3521,9 @@ def test_offset_failure_stalls_loudly(fake_table, monkeypatch):
         "key": None,
         "skip": 0,
         "pages_stored": 0,
-        "total_pages": 0,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0, 0, 0, 0, 0, 0],
         "digests": [],
         "restarts": 2,
     }
@@ -2541,9 +3563,11 @@ def test_windowed_partial_failure_twice_then_abandoned_third(fake_table, monkeyp
         "fetch_retell_page",
         lambda *a, **k: _page(_calls(2), has_more=False),
     )
-    monkeypatch.setattr(
-        op, "process_and_store_logs", lambda *a, **k: op.StoreOutcome(1, 0, 1)
-    )
+    # Two calls on the page: the first stores, the second fails to export —
+    # a `partial` verdict whose retry (v1.15 B5) re-stores the page from 0,
+    # so the same alternation repeats run after run.
+    per_call = itertools.cycle([op.StoreOutcome(1, 0, 0), op.StoreOutcome(0, 0, 1)])
+    monkeypatch.setattr(op, "process_and_store_logs", lambda *a, **k: next(per_call))
 
     for i in range(1, 3):
         provider = _retell_provider(fake_table[pid])
@@ -2627,7 +3651,7 @@ def test_manual_run_pages_up_to_cap_and_never_writes(fake_table, monkeypatch):
     provider = _retell_provider(row)
     calls_made = []
 
-    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None):
+    def fake_fetch(prov, start, end, *, pagination_key=None, skip=None, **kwargs):
         calls_made.append(pagination_key)
         return _page(_calls(1), has_more=True, next_key=f"k{len(calls_made)}")
 

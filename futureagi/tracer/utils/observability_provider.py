@@ -1,5 +1,4 @@
 import copy
-import hashlib
 import json
 import random
 import uuid
@@ -23,7 +22,6 @@ from tracer.services.observability_providers import (
     ObservabilityService,
     RetellConfigurationError,
     RetellCursorRejected,
-    RetellPage,
 )
 from tracer.utils.bland import normalize_bland_data
 from tracer.utils.eleven_labs import normalize_eleven_labs_data
@@ -52,9 +50,17 @@ RETELL_MAX_FAILED_RUNS = 3
 RETELL_MAX_WINDOW_RESTARTS = 3
 RETELL_MANUAL_RUN_MAX_PAGES = 5
 RETELL_RUN_BUDGET = timedelta(minutes=20)
-RETELL_ACTIVITY_BUDGET = timedelta(
-    hours=2
-)  # comfortably inside the 3h activity time_limit
+# v1.15 D. The deadline is honoured inside hydration and between stored calls,
+# so an activity overruns it by roughly: the detail requests in flight when it
+# passes (they run concurrently, so ~ one request of 3 x 30s + 2 x 30.5s, i.e.
+# ~2.5 min), plus one list request, plus the one call still being stored. That
+# last term is an estimate and NOT a ceiling: the recording download's 200s in
+# the shared converter is a per-read timeout, so a server that trickles bytes
+# is bounded only by the audio size cap, and the S3 upload names no timeout at
+# all. Bounding a download belongs in that converter (with the async rehost)
+# and is a follow-up. Only the first two terms are enforced; they cost ~5 min,
+# so the 3h time_limit leaves that unbounded one most of an hour to finish in.
+RETELL_ACTIVITY_BUDGET = timedelta(hours=2)
 
 
 @temporal_activity(
@@ -285,14 +291,6 @@ def _repair_future_watermark(
     return n
 
 
-def _page_digest(calls: list[dict]) -> str | None:
-    if not calls:
-        return None
-    return hashlib.sha256(
-        ",".join(sorted(c["call_id"] for c in calls)).encode()
-    ).hexdigest()
-
-
 def _parse(iso: str) -> datetime:
     return datetime.fromisoformat(
         iso
@@ -323,20 +321,26 @@ _WINDOW_TYPES = {
     "key": (str, type(None)),
     "skip": (int, type(None)),
     "pages_stored": int,
-    "total_pages": int,  # monotone across restarts (unlike pages_stored); bootstrap-cap-only, carried harmlessly by ordinary windows too
     "digests": list,
     "restarts": int,
+    # v1.15 B1: how far into the CURRENT page this window has got, so a run
+    # that stops mid-page resumes there instead of re-storing it.
+    "progress": int,
+    "page_digest": (str, type(None)),
+    # [stored, malformed, export_failed, dropped_no_end, dropped_missing,
+    # dropped_failed] for the current page, accumulated across runs
+    "page_counts": list,
 }
+_PAGE_COUNT_SLOTS = 6
 
 
-def _backfill_total_pages(window) -> None:
-    """F4/N5: a window persisted by v1.13 (before B7) has no "total_pages" key
-    and would otherwise fail `_valid_window` on deploy, discarding an
-    in-progress window instead of resuming it. Backfill it from the pages
-    already stored for this window before validation runs, so a v1.13 window
-    resumes rather than being re-listed from scratch."""
-    if isinstance(window, dict):
-        window.setdefault("total_pages", window.get("pages_stored", 0))
+def _reset_page_progress(window) -> None:
+    """v1.15 B1: the three page-progress keys only ever mean something about
+    the page the window is pointing AT, so they are cleared together — on every
+    cursor/offset advance, every restart, and every retry of the same page."""
+    window["progress"] = 0
+    window["page_digest"] = None
+    window["page_counts"] = [0] * _PAGE_COUNT_SLOTS
 
 
 def _valid_window(window) -> bool:
@@ -344,6 +348,19 @@ def _valid_window(window) -> bool:
         return False
     try:
         if not all(isinstance(window[k], t) for k, t in _WINDOW_TYPES.items()):
+            return False
+        counts = window["page_counts"]
+        # The only key whose type does not pin its shape, and the only one the
+        # store loop indexes: a wrong-length list would raise on every run for
+        # this provider for ever, where a discarded window just starts over.
+        if len(counts) != _PAGE_COUNT_SLOTS or not all(
+            isinstance(slot, int) for slot in counts
+        ):
+            return False
+        # Same exposure: `progress` is a position in the listed page, so a
+        # negative one would ask the fetcher to hydrate from behind the page's
+        # end on every run until a human noticed.
+        if window["progress"] < 0:
             return False
         if window["start"] is not None and _parse(window["start"]).tzinfo is None:
             return False  # bootstrap window: "start" is None, nothing to parse
@@ -366,21 +383,24 @@ def _new_window(
         "key": None,
         "skip": None,
         "pages_stored": 0,
-        "total_pages": 0,
         "digests": [],
         "restarts": 0,
+        "progress": 0,
+        "page_digest": None,
+        "page_counts": [0] * _PAGE_COUNT_SLOTS,
     }
 
 
-def _classify(
-    page: RetellPage, outcome: StoreOutcome
-) -> str:  # "ok" | "total" | "partial"
-    problems = (
-        outcome.export_failed + page.dropped_failed
-    )  # infra-shaped failures (retryable)
+def _classify(counts) -> str:  # "ok" | "total" | "partial"
+    """Verdict on a COMPLETE page, from its accumulated `page_counts`. It reads
+    the window's slots rather than the last response because a page stored over
+    several runs has its drops spread across all of them; the last response
+    only covers the slice it hydrated."""
+    stored, malformed, export_failed = counts[:3]
+    problems = export_failed + counts[5]  # infra-shaped failures (retryable)
     if problems == 0:
         return "ok"  # malformed-only pages are "ok": permanent, counted, never retried
-    if outcome.stored == 0 and problems >= outcome.malformed:
+    if stored == 0 and problems >= malformed:
         return "total"  # nothing worked, mostly for infra reasons: wait with backoff
     return "partial"  # retry the same page up to RETELL_MAX_FAILED_RUNS, then abandon the problems
 
@@ -388,6 +408,9 @@ def _classify(
 def _poll_retell_provider(
     provider, *, deadline: datetime | None = None
 ) -> StoreOutcome | None:
+    # Every returned outcome is the CURRENT page's counts so far — one meaning
+    # for the checkpoint and the completion paths, because the fan-out reads
+    # only None (this run failed) versus not None.
     provider_id = provider.id
     now = timezone.now()
     run_started = now  # same call as `now`: F2's per-run budget is measured from here
@@ -422,9 +445,7 @@ def _poll_retell_provider(
         window = state.get("window")
         # v1.13 §7: a stale window is discarded when bootstrapped is falsy —
         # UNLESS it is itself a bootstrap window (start is None), which is
-        # resumed rather than restarted from scratch. No total_pages backfill
-        # here: v1.13 never persisted a bootstrap window, and an ordinary
-        # v1.13 window is discarded by this very check.
+        # resumed rather than restarted from scratch.
         if not _valid_window(window) or window["start"] is not None:
             window = (
                 None  # anything malformed, or a stale ordinary window, is discarded
@@ -448,7 +469,6 @@ def _poll_retell_provider(
             start = wm
 
         window = state.get("window")
-        _backfill_total_pages(window)
         if not _valid_window(window):
             window = None  # anything malformed is treated as "no window in progress"
         if window is None:
@@ -474,13 +494,58 @@ def _poll_retell_provider(
                 window_end,
                 pagination_key=window["key"],
                 skip=window["skip"],
+                resume_from=window["progress"],
+                resume_digest=window["page_digest"],
+                deadline=run_deadline,
             )
         except RetellCursorRejected as exc:
             return _restart_window(provider_id, state, cause=exc.cause)
-        digest = _page_digest(page.calls)
-        if window["pages_stored"] > 0 and page.has_more and digest is None:
+        # An empty listing is a paging fault, not page instability: judge it
+        # before the digest comparison so it is never scored as a mismatch. A
+        # resumed first page has no completed page yet but does have progress;
+        # it is just as much "already paging" as a completed one.
+        if (
+            (window["pages_stored"] > 0 or window["progress"] > 0)
+            and page.has_more
+            and page.digest is None
+        ):
             return _restart_window(provider_id, state, cause="empty_page")
-        if digest is not None and digest in window["digests"]:
+        # v1.15 B3: a resumed page that no longer hashes the same is a
+        # different page — the fetcher already re-hydrated it from 0, so drop
+        # the progress and re-store it (re-emits are idempotent: deterministic
+        # trace ids, collector versions by receive time, usage metered once).
+        page_changed = window["progress"] > 0 and page.digest != window["page_digest"]
+        if page_changed:
+            state["page_changed"] = state.get("page_changed", 0) + 1
+            if state["page_changed"] >= RETELL_MAX_FAILED_RUNS:
+                # A page that keeps coming back re-ordered, on a window whose
+                # stores need more than one run, re-stores its prefix and
+                # checkpoints again for ever: the cursor never moves, so the
+                # frontier never ages into `retell_poll_behind` either and the
+                # only signal is one warning a run. The count is per page (a
+                # completed page clears it), so the third mismatch on one page
+                # is treated like an outage — stop spinning the provider, and
+                # say so where an operator is already listening.
+                state["total_failures"] = state.get("total_failures", 0) + 1
+                state["backoff_until"] = (
+                    timezone.now() + _backoff_delay(state["total_failures"])
+                ).isoformat()
+                logger.error(
+                    "retell_page_unstable",
+                    provider_id=str(provider_id),
+                    page_changed=state["page_changed"],
+                    backoff_until=state["backoff_until"],
+                )
+                _reset_page_progress(window)
+                _write_retell_state(provider_id, state)
+                return None
+            logger.warning(
+                "retell_page_changed",
+                provider_id=str(provider_id),
+                progress=window["progress"],
+            )
+            _reset_page_progress(window)
+        if page.digest is not None and page.digest in window["digests"]:
             return _restart_window(provider_id, state, cause="page_repeated")
         if (
             not bootstrap
@@ -489,32 +554,112 @@ def _poll_retell_provider(
         ):  # a window that needs more than 50 pages is not being paged honestly: restart → narrow
             return _restart_window(provider_id, state, cause="page_cap")
 
-        outcome = process_and_store_logs(page.calls, provider)
+        # v1.15 B5: store call by call so the deadline can be honoured INSIDE a
+        # page. `counts` accumulates the page's whole fate in the window across
+        # runs — the drops as well as the stores, because a resumed response
+        # describes only the slice it hydrated, so drops decided before a
+        # checkpoint are in no later response and a lossy page would otherwise
+        # complete as "ok".
+        counts = window["page_counts"]
+        checkpoint = False
+        for index, call in zip(page.indices, page.calls, strict=True):
+            o = process_and_store_logs([call], provider)
+            counts[0] += o.stored
+            counts[1] += o.malformed
+            counts[2] += o.export_failed
+            window["progress"] = index + 1
+            if timezone.now() >= run_deadline and index + 1 < page.listed:
+                checkpoint = True
+                break
+        if not checkpoint:
+            # Trailing drops are consumed too; a short `consumed` means
+            # hydration itself stopped at the deadline (v1.15 A3).
+            window["progress"] = page.consumed
+            checkpoint = page.consumed < page.listed
+        # The drops go in only now that `progress` is final, and only the ones
+        # it covers: the next run re-lists from `progress` and the fetcher
+        # decides the fate of every item after it again, so a drop counted here
+        # while sitting past the checkpoint would be counted a second time then
+        # — enough to read a merely lossy page as a total outage and back the
+        # provider off for hours.
+        for index, slot in page.drops:
+            if index < window["progress"]:
+                counts[slot] += 1
+        if checkpoint:
+            if (
+                window["progress"] == 0
+                and window["page_digest"] is None
+                and not page_changed
+            ):
+                # The deadline went during the list request: nothing hydrated,
+                # nothing stored, no page identity to remember. A checkpoint
+                # here would persist state and announce progress for a run that
+                # learned nothing, and the next run starts from 0 regardless.
+                # A mismatch IS something learned: its count must reach the
+                # store, or an unstable page polled on a spent deadline could
+                # never reach the backoff threshold.
+                return StoreOutcome(0, 0, 0)
+            # Whatever this response hydrated past `progress` is discarded with
+            # it, so those detail requests are made again next run — at most one
+            # page of Get Calls. Paying that keeps the checkpoint at the call the
+            # deadline actually landed on, instead of storing on to `consumed`
+            # and blowing the very bound the checkpoint exists to hold.
+            window["page_digest"] = page.digest
+            if not _write_retell_state(provider_id, state):
+                return None
+            logger.info(
+                "retell_page_checkpointed",
+                provider_id=str(provider_id),
+                progress=window["progress"],
+                listed=page.listed,
+            )
+            # A slow page is the one case where the frontier ages while the
+            # cursor stands still, so the behind/stalled alarm must fire from
+            # here too, not only on a cursor advance. Gated on the warn
+            # threshold: a checkpoint forced by the shared activity deadline
+            # can land on a frontier only a minute old, and that is not news.
+            behind_now = timezone.now()
+            if not bootstrap and (behind_now - window_end) > RETELL_BEHIND_WARN:
+                _log_behind(provider_id, behind_now, window_end, window["pages_stored"])
+            # no verdict, no cursor move: the same page resumes next run
+            return StoreOutcome(*counts[:3])
+
+        outcome = StoreOutcome(*counts[:3])
         _log_counts(
             provider_id,
             "bootstrap" if bootstrap else "window",
             window["pages_stored"],
             page,
-            outcome,
+            counts,
         )
-        verdict = _classify(page, outcome)
+        verdict = _classify(counts)
         if verdict == "total":
-            return _on_total_failure(provider_id, state, page, outcome)
+            # The whole page is retried next run, so its part-done progress and
+            # its (all-failed) counts must go with it — kept, they would make
+            # every later run re-classify the same stale totals and never
+            # re-store a thing. Not spelled out in v1.15 B5, which only says
+            # this for `partial`; the same reason applies here.
+            _reset_page_progress(window)  # rebinds, so `counts` keeps the totals
+            return _on_total_failure(provider_id, state, counts)
         state.pop("total_failures", None)
         state.pop("backoff_until", None)
         if verdict == "partial":
             state["failed_runs"] = state.get("failed_runs", 0) + 1
             if state["failed_runs"] < RETELL_MAX_FAILED_RUNS:
-                _log_incomplete(provider_id, page, outcome, state["failed_runs"])
+                _log_incomplete(provider_id, counts, state["failed_runs"])
+                _reset_page_progress(window)  # v1.15 B5: the retry re-stores from 0
                 _write_retell_state(provider_id, state)
                 return None  # same page is retried next run (bootstrap: marker not set until it completes)
             logger.error(
                 "retell_page_abandoned",
                 provider_id=str(provider_id),
-                abandoned=outcome.export_failed + page.dropped_failed,
+                abandoned=counts[2] + counts[5],
                 failed_runs=state["failed_runs"],
             )
         state.pop("failed_runs", None)
+        # The page is done, so whatever instability its resumes saw is behind
+        # us: only repeated mismatches on one page say the listing is unusable.
+        state.pop("page_changed", None)
         if outcome.stored == 0 and outcome.malformed > 0:
             logger.warning(
                 "retell_page_all_malformed",
@@ -522,37 +667,39 @@ def _poll_retell_provider(
                 malformed=outcome.malformed,
             )
         window["pages_stored"] += 1
-        window["total_pages"] += (
-            1  # never reset by _restart_window: the bootstrap cap survives restarts (v1.14 R1 H1)
-        )
-        if digest is not None:
-            window["digests"] = (window["digests"] + [digest])[-RETELL_DIGEST_HISTORY:]
+        if page.digest is not None:
+            window["digests"] = (window["digests"] + [page.digest])[
+                -RETELL_DIGEST_HISTORY:
+            ]
 
         # A page cap caught here (post-store) completes the bootstrap instead of
         # restarting it: unlike a windowed page_cap, this is not "paging isn't
         # working", just "that's enough calls for a first sync" (newest 1000).
-        # Measured against total_pages (restart-proof), not pages_stored (reset
-        # by every restart) — see H1.
+        # v1.15 B5: measured on `pages_stored`, the CONTIGUOUS pages of one
+        # attempt — a restart re-lists from page 1 and zeroes it with them, so
+        # replayed pages can never spend the cap on history already covered.
         capped = (
             bootstrap
             and page.has_more
-            and window["total_pages"] >= RETELL_BOOTSTRAP_MAX_PAGES
+            and window["pages_stored"] >= RETELL_BOOTSTRAP_MAX_PAGES
         )
         if capped:
             logger.info(
                 "retell_bootstrap_capped",
                 provider_id=str(provider_id),
                 pages_stored=window["pages_stored"],
-                total_pages=window[
-                    "total_pages"
-                ],  # F7/N8: pages_stored kept for continuity
             )
 
+        # A page stored across several runs takes `has_more` and `next_key` from
+        # whichever response completed it, never from the first: both are read
+        # only here, once the page is done, and the cursor that follows the page
+        # as Retell listed it last is the one that pages on from it correctly.
         if page.has_more and not capped:
             if window["skip"] is not None:
                 window["skip"] += RETELL_LIST_PAGE_LIMIT
             else:
                 window["key"] = page.next_key
+            _reset_page_progress(window)  # the cursor moved: a new page starts at 0
             if not _write_retell_state(provider_id, state):
                 return None
             if not bootstrap:  # the bootstrap frontier is frozen, not "behind"
@@ -615,18 +762,20 @@ def _poll_retell_provider(
         return outcome
 
 
-def _log_counts(provider_id, mode, pages_stored, page, outcome):
+def _log_counts(provider_id, mode, pages_stored, page, counts):
+    # Every number here is the COMPLETE page's, accumulated across however many
+    # runs it took; the page argument is only for `has_more`.
     logger.info(
         "retell_poll_counts",
         provider_id=str(provider_id),
         mode=mode,
         pages_stored=pages_stored,
-        stored=outcome.stored,
-        malformed=outcome.malformed,
-        export_failed=outcome.export_failed,
-        dropped_no_end=page.dropped_no_end,
-        dropped_missing=page.dropped_missing,
-        dropped_failed=page.dropped_failed,
+        stored=counts[0],
+        malformed=counts[1],
+        export_failed=counts[2],
+        dropped_no_end=counts[3],
+        dropped_missing=counts[4],
+        dropped_failed=counts[5],
         has_more=page.has_more,
     )
 
@@ -649,26 +798,26 @@ def _log_behind(provider_id, now, window_end, pages_stored):
         )
 
 
-def _log_incomplete(provider_id, page, outcome, failed_runs):
+def _log_incomplete(provider_id, counts, failed_runs):
     logger.warning(
         "retell_store_incomplete",
         provider_id=str(provider_id),
-        stored=outcome.stored,
-        export_failed=outcome.export_failed,
-        dropped_failed=page.dropped_failed,
-        malformed=outcome.malformed,
+        stored=counts[0],
+        export_failed=counts[2],
+        dropped_failed=counts[5],
+        malformed=counts[1],
         failed_runs=failed_runs,
     )
 
 
 def _on_total_failure(
-    provider_id, state, page, outcome
+    provider_id, state, counts
 ) -> None:  # outage / misconfiguration: wait with backoff, never abandon
     state["total_failures"] = state.get("total_failures", 0) + 1
     state["backoff_until"] = (
         timezone.now() + _backoff_delay(state["total_failures"])
     ).isoformat()  # fresh clock: the page may have taken minutes
-    _log_incomplete(provider_id, page, outcome, state.get("failed_runs", 0))
+    _log_incomplete(provider_id, counts, state.get("failed_runs", 0))
     _write_retell_state(
         provider_id, state
     )  # a skipped write is logged by the helper; this run ends without progress either way
@@ -677,10 +826,11 @@ def _on_total_failure(
 
 def _complete_bootstrap(provider_id, state, end: datetime) -> bool:
     """Finish a bootstrap: watermark repair/advance to ``end`` (the frozen
-    first-run end), then replace state with just the marker. Shared by the
-    normal completion path (page loop, not has_more / capped) and the
-    terminal branch of ``_restart_window`` (offset mode also stuck) so the
-    two can never drift (v1.14 R1 H1). Returns whether the write succeeded.
+    first-run end), then replace state with just the marker — which is also
+    what clears ``bootstrap_stuck``. v1.15 B6 leaves this with a single caller
+    (the page loop, not has_more / capped): a bootstrap that cannot page is
+    now retried behind a backoff, never completed without coverage. Returns
+    whether the write succeeded.
     """
     if (
         _repair_future_watermark(provider_id, end, end) == 0
@@ -704,6 +854,8 @@ def _restart_window(provider_id, state, *, cause) -> None:
     window["key"] = None
     window["pages_stored"] = 0
     window["digests"] = []
+    _reset_page_progress(window)  # v1.15 B1: a restart re-lists from page 1
+    state.pop("page_changed", None)  # the page those mismatches belonged to is gone
     if window["restarts"] >= RETELL_MAX_WINDOW_RESTARTS:
         bootstrap = window["start"] is None
         width = None if bootstrap else _parse(window["end"]) - _parse(window["start"])
@@ -729,11 +881,28 @@ def _restart_window(provider_id, state, *, cause) -> None:
             window["skip"] = 0
             window["restarts"] = 0
             logger.error("retell_window_offset_mode", provider_id=str(provider_id))
-        else:  # offset paging failed too: terminal for bootstrap (v1.14 R1 H1), stall loudly for windows
+        elif bootstrap:
+            # v1.15 B6: a bootstrap whose offset fallback failed too must NOT
+            # complete — that would advance the watermark past history it never
+            # covered and exclude those calls from every later window. Keep the
+            # window (frozen `end` and all), back off with escalation, and try
+            # the whole attempt again in cursor mode when the backoff expires.
+            state["bootstrap_stuck"] = state.get("bootstrap_stuck", 0) + 1
+            state["backoff_until"] = (
+                timezone.now() + _backoff_delay(state["bootstrap_stuck"])
+            ).isoformat()
+            window["skip"] = None
+            window["restarts"] = 0
+            logger.error(
+                "retell_bootstrap_stuck",
+                provider_id=str(provider_id),
+                stuck_runs=state["bootstrap_stuck"],
+                backoff_until=state["backoff_until"],
+            )
+            _write_retell_state(provider_id, state)
+            return None
+        else:  # offset paging failed too: stall loudly, never advance
             logger.error("retell_window_stuck", provider_id=str(provider_id))
-            if bootstrap:
-                _complete_bootstrap(provider_id, state, _parse(window["end"]))
-                return None
             window["skip"] = 0
             window["restarts"] = 0
     else:
@@ -769,7 +938,22 @@ def _manual_retell_run(
             provider, start_time, end, pagination_key=key
         )  # RetellCursorRejected propagates: the run fails
         outcome = process_and_store_logs(page.calls, provider)
-        _log_counts(provider_id, "manual", pages, page, outcome)
+        # A manual run has no window to accumulate in: one response IS the
+        # whole page, so its own drop counters are the page's.
+        _log_counts(
+            provider_id,
+            "manual",
+            pages,
+            page,
+            [
+                outcome.stored,
+                outcome.malformed,
+                outcome.export_failed,
+                page.dropped_no_end,
+                page.dropped_missing,
+                page.dropped_failed,
+            ],
+        )
         pages += 1
         calls += len(page.calls)
         has_more = page.has_more

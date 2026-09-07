@@ -1,14 +1,17 @@
 import concurrent.futures
+import hashlib
 import math
 import random
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import requests
 import structlog
+from django.utils import timezone
 
 from simulate.models.agent_definition import AgentDefinition, ProviderCredentials
 from tracer.constants.external_endpoints import ObservabilityRoutes
@@ -47,6 +50,35 @@ def _retell_retry_after_seconds(response: requests.Response) -> float | None:
     return min(seconds, RETELL_RETRY_AFTER_CAP_SECONDS)
 
 
+def _retell_page_digest(items: list[Any]) -> str | None:
+    """sha256 over the call ids of a page in the order Retell listed them —
+    before hydration, before any drop; None for a page with no items.
+
+    v1.15 A1: the digest identifies the LISTED page, so one value serves both
+    purposes — the orchestrator detects a repeated page with it AND validates
+    that a resumed page is still the same list its earlier run stored from.
+    Order belongs to that identity because a resume skips a PREFIX by
+    position: a page with the same members in a new order would otherwise be
+    resumed over calls that had moved out of the prefix, storing those twice
+    and never storing the ones that moved in. A literal repeat comes back in
+    the same order, so `page_repeated` still sees it.
+    """
+    if not items:
+        return None
+    ids = [str(item.get("call_id")) if isinstance(item, dict) else "" for item in items]
+    return hashlib.sha256(",".join(ids).encode()).hexdigest()
+
+
+# Which slot of the orchestrator's per-page counts each kind of drop belongs
+# to. A drop is reported with the list index it happened at (`RetellPage.drops`)
+# because a page is stored over several runs: the run that resumes it re-decides
+# the fate of everything from its resume point on, so the caller can only count
+# a drop once it knows the index is behind the point it will resume from.
+_DROP_SLOT_NO_END = 3
+_DROP_SLOT_MISSING = 4
+_DROP_SLOT_FAILED = 5
+
+
 @dataclass(frozen=True)
 class RetellPage:
     calls: list[dict]
@@ -55,6 +87,11 @@ class RetellPage:
     dropped_no_end: int
     dropped_missing: int
     dropped_failed: int
+    digest: str | None
+    listed: int
+    consumed: int
+    indices: tuple[int, ...]
+    drops: tuple[tuple[int, int], ...]
 
 
 class RetellConfigurationError(Exception):
@@ -393,63 +430,113 @@ class ObservabilityService:
 
     @staticmethod
     def _hydrate_retell_calls(
-        items: list[dict[str, Any]], headers: dict[str, str]
-    ) -> tuple[list[dict[str, Any]], int, int, int]:
-        """Hydrate every list item; drop and count items that never yield a usable call.
+        items: list[dict[str, Any]],
+        headers: dict[str, str],
+        *,
+        start: int = 0,
+        deadline: datetime | None = None,
+    ) -> tuple[
+        list[dict[str, Any]],
+        tuple[int, ...],
+        int,
+        int,
+        int,
+        int,
+        tuple[tuple[int, int], ...],
+    ]:
+        """Hydrate ``items[start:]`` in list order; drop and count items that
+        never yield a usable call. Returns ``(calls, indices, dropped_no_end,
+        dropped_missing, dropped_failed, consumed, drops)``, where ``drops``
+        pairs each dropped item's LIST INDEX with its count slot and the three
+        scalars are just its totals.
 
         Detail requests for one page run through a bounded thread pool
         (RETELL_HYDRATION_WORKERS) so a large page's serial Get Call calls
-        cannot alone exhaust the activity deadline. Results are consumed in
-        the order Retell returned them, so the dedup rule below (last
-        call_id wins) is unaffected by concurrency. A 401/403 from any item
-        still fails the whole page, but only once every submitted request
-        has finished (the pool is never cancelled early).
-        """
-        dropped_no_end = dropped_missing = dropped_failed = 0
-        candidates: list[tuple[str, dict[str, Any]]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                # A malformed envelope entry, not a per-call HTTP outcome.
-                dropped_failed += 1
-                continue
-            if item.get("end_timestamp") is None:
-                dropped_no_end += 1
-                continue
-            call_id = item.get("call_id")
-            if not isinstance(call_id, str) or not call_id:
-                # No request can be made without a usable id; same bucket as a
-                # Retell-confirmed unknown id, since retrying never helps either.
-                dropped_missing += 1
-                continue
-            candidates.append((call_id, item))
+        cannot alone exhaust the activity deadline. A 401/403 from any item
+        still fails the whole page, but only once every submitted request has
+        finished (the pool is never cancelled early).
 
-        by_call_id: dict[str, dict[str, Any]] = {}
+        v1.15 A3: with a ``deadline``, a candidate is submitted only while the
+        clock is still short of it, and the first candidate NOT submitted ends
+        consumption — ``consumed`` is its index, and drops after it are not
+        counted, so the orchestrator can resume the same listed page there.
+        At most RETELL_HYDRATION_WORKERS requests are outstanding at any time
+        (submission waits for the oldest instead of queueing the whole page),
+        which is what makes the deadline check bite and bounds the overrun to
+        those few in flight.
+        """
+        listed = len(items)
+        drops: list[tuple[int, int]] = []
+        consumed = listed
+        # call_id -> (list index, merged call); a repeated id keeps the LAST
+        # occurrence and that occurrence's index.
+        hydrated: dict[str, tuple[int, dict[str, Any]]] = {}
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=RETELL_HYDRATION_WORKERS
         ) as executor:
-            results = executor.map(
-                lambda pair: ObservabilityService._fetch_retell_call_detail(
-                    pair[1], headers
-                ),
-                candidates,
-            )
-            for (call_id, _item), (merged, reason) in zip(
-                candidates, results, strict=True
-            ):
+            in_flight: deque[tuple[int, str, concurrent.futures.Future]] = deque()
+
+            def collect() -> None:
+                index, call_id, future = in_flight.popleft()
+                merged, reason = future.result()
                 if reason == "missing":
-                    dropped_missing += 1
+                    drops.append((index, _DROP_SLOT_MISSING))
+                elif reason == "failed":
+                    drops.append((index, _DROP_SLOT_FAILED))
+                else:
+                    # Key off the list item's own id, not the merged one: a
+                    # detail body can only ever add fields, never replace an
+                    # already-hashable key.
+                    hydrated[call_id] = (index, merged)
+
+            for index in range(start, listed):
+                item = items[index]
+                if not isinstance(item, dict):
+                    # A malformed envelope entry, not a per-call HTTP outcome.
+                    drops.append((index, _DROP_SLOT_FAILED))
                     continue
-                if reason == "failed":
-                    dropped_failed += 1
+                if item.get("end_timestamp") is None:
+                    drops.append((index, _DROP_SLOT_NO_END))
                     continue
-                # Key off the list item's own id, not the merged one: a detail
-                # body can only ever add fields, never replace an already-hashable key.
-                by_call_id[call_id] = merged
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    # No request can be made without a usable id; same bucket as a
+                    # Retell-confirmed unknown id, since retrying never helps either.
+                    drops.append((index, _DROP_SLOT_MISSING))
+                    continue
+                while len(in_flight) >= RETELL_HYDRATION_WORKERS:
+                    collect()
+                if deadline is not None and timezone.now() >= deadline:
+                    consumed = index
+                    break
+                in_flight.append(
+                    (
+                        index,
+                        call_id,
+                        executor.submit(
+                            ObservabilityService._fetch_retell_call_detail,
+                            item,
+                            headers,
+                        ),
+                    )
+                )
+            while in_flight:
+                collect()
+
+        ordered = sorted(hydrated.values(), key=lambda pair: pair[0])
+        # Drops are appended as they are decided, and a pooled one is decided
+        # when its request is collected, not when it was submitted; sort so the
+        # tuple reads in list order like `indices` does.
+        by_index = sorted(drops)
         return (
-            list(by_call_id.values()),
-            dropped_no_end,
-            dropped_missing,
-            dropped_failed,
+            [merged for _index, merged in ordered],
+            tuple(index for index, _merged in ordered),
+            sum(1 for _index, slot in by_index if slot == _DROP_SLOT_NO_END),
+            sum(1 for _index, slot in by_index if slot == _DROP_SLOT_MISSING),
+            sum(1 for _index, slot in by_index if slot == _DROP_SLOT_FAILED),
+            consumed,
+            tuple(by_index),
         )
 
     @staticmethod
@@ -507,8 +594,11 @@ class ObservabilityService:
         *,
         pagination_key: str | None = None,
         skip: int | None = None,
+        resume_from: int = 0,
+        resume_digest: str | None = None,
+        deadline: datetime | None = None,
     ) -> RetellPage:
-        """Fetch exactly ONE Retell list-calls page, fully hydrated.
+        """Fetch exactly ONE Retell list-calls page, hydrated up to the deadline.
 
         Modes are defined by request shape, independent of bootstrap vs
         windowed: offset mode = ``skip is not None``; cursor mode =
@@ -516,6 +606,13 @@ class ObservabilityService:
         mode (``start_time is None``) pages the same as windowed mode, under
         the same one-of ``pagination_key``/``skip`` rule. Knows nothing about
         watermarks or storage; never writes provider state.
+
+        v1.15 A2: ``resume_from``/``resume_digest`` continue a page an earlier
+        run stored only part of — the leading items are skipped only when the
+        page still hashes to ``resume_digest``, so a page that changed under us
+        is re-listed from 0 and the caller sees the mismatch on ``digest``.
+        ``deadline`` bounds hydration itself; ``None`` (manual runs, existing
+        callers) means unbounded, exactly as before.
         """
         if end_time is None or end_time.tzinfo is None:
             raise RetellConfigurationError("Retell fetch needs an aware end_time")
@@ -610,8 +707,26 @@ class ObservabilityService:
             next_key = raw_key if has_more else None
 
         items = payload.get("items") or []
-        calls, dropped_no_end, dropped_missing, dropped_failed = (
-            ObservabilityService._hydrate_retell_calls(items, headers)
+        digest = _retell_page_digest(items)
+        listed = len(items)
+        # A resume is honoured only against the identical listed page; a
+        # different digest (or none remembered) re-hydrates from 0 and the
+        # orchestrator reconciles what it already stored (v1.15 A2/B3).
+        resume_start = (
+            resume_from
+            if resume_from > 0 and resume_digest is not None and digest == resume_digest
+            else 0
+        )
+        (
+            calls,
+            indices,
+            dropped_no_end,
+            dropped_missing,
+            dropped_failed,
+            consumed,
+            drops,
+        ) = ObservabilityService._hydrate_retell_calls(
+            items, headers, start=resume_start, deadline=deadline
         )
         if dropped_missing:
             logger.warning(
@@ -633,6 +748,11 @@ class ObservabilityService:
             dropped_no_end=dropped_no_end,
             dropped_missing=dropped_missing,
             dropped_failed=dropped_failed,
+            digest=digest,
+            listed=listed,
+            consumed=consumed,
+            indices=indices,
+            drops=drops,
         )
 
     @staticmethod

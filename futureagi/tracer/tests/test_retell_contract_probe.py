@@ -36,8 +36,37 @@ class TestFetcherSurface:
             "dropped_no_end",
             "dropped_missing",
             "dropped_failed",
+            # amendment v1.15 A1: the listed page's identity and how far into
+            # it this response got, so a page can be resumed call by call.
+            "digest",
+            "listed",
+            "consumed",
+            "indices",
+            # v1.15.2 F8: every drop with the list index it happened at, so the
+            # orchestrator counts each one exactly once across resumes.
+            "drops",
         ]
         assert m.RetellPage.__dataclass_params__.frozen
+        assert (m._DROP_SLOT_NO_END, m._DROP_SLOT_MISSING, m._DROP_SLOT_FAILED) == (
+            3,
+            4,
+            5,
+        )  # the orchestrator's `page_counts` slots, by position
+
+    def test_page_digest_is_a_hash_of_listed_ids_in_list_order(self):
+        """v1.15.1 F2: the digest is over the call_ids of the page in the order
+        Retell listed them, and never carries an id itself. Order is part of
+        the page's identity because a resume skips a prefix by position."""
+        m = _fetcher()
+        digest = m._retell_page_digest([{"call_id": "call_b"}, {"call_id": "call_a"}])
+        assert len(digest) == 64 and "call_a" not in digest
+        assert digest != m._retell_page_digest(
+            [{"call_id": "call_a"}, {"call_id": "call_b"}]
+        )
+        assert digest == m._retell_page_digest(
+            [{"call_id": "call_b"}, {"call_id": "call_a"}]
+        )  # a literal repeat still hashes the same, so page_repeated survives
+        assert m._retell_page_digest([]) is None
 
     def test_exception_types(self):
         m = _fetcher()
@@ -62,10 +91,21 @@ class TestFetcherSurface:
             "end_time",
             "pagination_key",
             "skip",
+            # amendment v1.15 A2
+            "resume_from",
+            "resume_digest",
+            "deadline",
         ]
         for p in params[3:]:
             assert p.kind is inspect.Parameter.KEYWORD_ONLY
-            assert p.default is None
+        defaults = {p.name: p.default for p in params[3:]}
+        assert defaults == {
+            "pagination_key": None,
+            "skip": None,
+            "resume_from": 0,
+            "resume_digest": None,
+            "deadline": None,
+        }
 
     def test_constants(self):
         m = _fetcher()
@@ -184,7 +224,6 @@ class TestOrchestratorSurface:
             "_repair_future_watermark",
             "_write_retell_state",
             "_read_retell_state",
-            "_page_digest",
             "_parse",
             "_backoff_delay",
             "_hint_for",
@@ -196,7 +235,8 @@ class TestOrchestratorSurface:
             "_log_behind",
             "_valid_window",
             "_new_window",  # v1.14 review fix F6
-            "_backfill_total_pages",  # v1.14 review fix F4
+            "_reset_page_progress",  # amendment v1.15 B1
+            "_complete_bootstrap",
             "_poll_retell_provider",
             "_manual_retell_run",
             "_poll_other_provider",
@@ -204,6 +244,11 @@ class TestOrchestratorSurface:
             assert callable(getattr(m, name)), name
         assert not hasattr(m, "_update_last_fetched_at")
         assert not hasattr(m, "normalize_and_store_logs")
+        # v1.15 B1/B4: the digest now belongs to the fetcher (it is over the
+        # LISTED page, which only the fetcher sees), and `total_pages` — with
+        # its deploy-compat backfill — is gone with the cap it fed.
+        assert not hasattr(m, "_page_digest")
+        assert not hasattr(m, "_backfill_total_pages")
 
     def test_valid_window_rejects_malformed_state(self):
         m = _orchestrator()
@@ -215,17 +260,35 @@ class TestOrchestratorSurface:
             "key": None,
             "skip": None,
             "pages_stored": 0,
-            "total_pages": 0,
             "digests": [],
             "restarts": 0,
+            "progress": 0,
+            "page_digest": None,
+            "page_counts": [0, 0, 0, 0, 0, 0],
         }
         assert m._valid_window(good)
         assert not m._valid_window({**good, "digests": "notalist"})
         assert not m._valid_window({**good, "start": 12345})
         assert not m._valid_window({**good, "start": "2026-09-03T00:00:00"})
-        assert not m._valid_window(
-            {**good, "total_pages": "0"}
-        )  # v1.14 review fix F1: must be an int
+        # v1.15 B1: the three page-progress keys are required and typed — no
+        # compat shim, a window missing or mistyping one is simply discarded.
+        assert not m._valid_window({k: v for k, v in good.items() if k != "progress"})
+        assert not m._valid_window({**good, "progress": "0"})
+        assert not m._valid_window({**good, "page_digest": 7})
+        assert not m._valid_window({**good, "page_counts": "000"})
+        # v1.15.1 F4: `page_counts` is the one key the store loop indexes, so
+        # its LENGTH is part of the shape — a wrong-width list would otherwise
+        # pass here and then raise on every run for this provider for ever.
+        assert not m._valid_window({**good, "page_counts": []})
+        assert not m._valid_window({**good, "page_counts": [1]})
+        assert not m._valid_window({**good, "page_counts": [0, 0, 0]})
+        assert not m._valid_window({**good, "page_counts": [0, 0, 0, 0, 0, 0, 0]})
+        assert not m._valid_window({**good, "page_counts": [0, 0, 0, 0, 0, "0"]})
+        # v1.15.2 F12: `progress` is a position in the listed page, so its sign
+        # is part of its shape — a negative one is corruption, not a resume, and
+        # nothing downstream clamps it any more.
+        assert not m._valid_window({**good, "progress": -1})
+        assert m._valid_window({**good, "progress": 7})
         assert not m._valid_window("nope")
 
     def test_valid_window_accepts_bootstrap_shape(self):
@@ -240,9 +303,11 @@ class TestOrchestratorSurface:
             "key": None,
             "skip": None,
             "pages_stored": 0,
-            "total_pages": 0,
             "digests": [],
             "restarts": 0,
+            "progress": 0,
+            "page_digest": None,
+            "page_counts": [0, 0, 0, 0, 0, 0],
         }
         assert m._valid_window(bootstrap)
         assert not m._valid_window(
@@ -263,9 +328,11 @@ class TestOrchestratorSurface:
             "key": "k",
             "skip": None,
             "pages_stored": 3,
-            "total_pages": 3,
             "digests": ["d"],
             "restarts": m.RETELL_MAX_WINDOW_RESTARTS - 1,
+            "progress": 4,
+            "page_digest": "d0",
+            "page_counts": [4, 0, 0, 0, 0, 0],
         }
         state = {"window": window}
         with patch.object(m, "_write_retell_state", return_value=True):
@@ -275,10 +342,10 @@ class TestOrchestratorSurface:
         assert window["narrowed"] is False  # never halved
         assert "window_hint_seconds" not in state
 
-    def test_restart_window_never_resets_total_pages(self):
-        """v1.14 review fix F1 (R1 H1): `total_pages` is the restart-proof
-        counter the bootstrap cap is measured against — unlike `pages_stored`,
-        `key`, and `digests`, a restart must never reset it."""
+    def test_restart_window_resets_page_progress(self):
+        """v1.15 B1: a restart re-lists from page 1, so the progress into the
+        page it was on — and that page's accumulated counts — must go with the
+        cursor and digests it already resets."""
         m = _orchestrator()
         window = {
             "start": None,
@@ -288,21 +355,25 @@ class TestOrchestratorSurface:
             "key": "k",
             "skip": None,
             "pages_stored": 3,
-            "total_pages": 7,
             "digests": ["d"],
             "restarts": 0,
+            "progress": 37,
+            "page_digest": "d0",
+            "page_counts": [37, 0, 0, 0, 0, 0],
         }
         state = {"window": window}
         with patch.object(m, "_write_retell_state", return_value=True):
             m._restart_window("pid", state, cause="missing_key")
-        assert window["pages_stored"] == 0  # reset
-        assert window["total_pages"] == 7  # NOT reset
+        assert window["pages_stored"] == 0
+        assert window["progress"] == 0
+        assert window["page_digest"] is None
+        assert window["page_counts"] == [0, 0, 0, 0, 0, 0]
 
-    def test_restart_window_bootstrap_offset_stuck_terminates_instead_of_looping(self):
-        """v1.14 review fix F1 (R1 H1): a bootstrap whose offset-mode fallback
-        also exhausts its restarts must COMPLETE the bootstrap (marker set,
-        watermark advanced to the frozen end), not loop `retell_window_stuck`
-        forever the way v1.13's windowed stuck branch does."""
+    def test_restart_window_bootstrap_offset_stuck_backs_off_without_completing(self):
+        """v1.15 B6: a bootstrap whose offset-mode fallback also exhausts its
+        restarts must NEVER complete — completing would advance the watermark
+        over history it never covered. It keeps the window (same frozen `end`),
+        resets to a fresh cursor-mode attempt, and backs off with escalation."""
         m = _orchestrator()
         window = {
             "start": None,
@@ -311,25 +382,33 @@ class TestOrchestratorSurface:
             "narrowed": False,
             "key": None,
             "skip": 0,
-            "pages_stored": 0,
-            "total_pages": 5,
-            "digests": [],
+            "pages_stored": 5,
+            "digests": ["d"],
             "restarts": m.RETELL_MAX_WINDOW_RESTARTS - 1,
+            "progress": 0,
+            "page_digest": None,
+            "page_counts": [0, 0, 0, 0, 0, 0],
         }
         state = {"window": window}
-        with patch.object(m, "_complete_bootstrap", return_value=True) as mock_complete:
+        with (
+            patch.object(m, "_complete_bootstrap") as mock_complete,
+            patch.object(m, "_write_retell_state", return_value=True),
+        ):
             m._restart_window("pid", state, cause="missing_key")
-        mock_complete.assert_called_once_with("pid", state, m._parse(window["end"]))
+        mock_complete.assert_not_called()
+        assert state["bootstrap_stuck"] == 1
+        assert "backoff_until" in state
+        assert window["end"] == "2026-09-03T00:10:00+00:00"  # frozen end kept
+        assert window["skip"] is None and window["key"] is None  # cursor mode again
+        assert window["pages_stored"] == 0 and window["restarts"] == 0
 
-    def test_complete_bootstrap_helper_shared_by_completion_and_stuck_paths(self):
-        """v1.14 review fix F1: both the normal completion branch and the
-        terminal stuck branch must call the SAME `_complete_bootstrap` helper
-        so they cannot drift."""
+    def test_complete_bootstrap_has_a_single_caller(self):
+        """v1.15 B7: `_complete_bootstrap` is kept as a helper but is now
+        reached only from the page loop's completion path — the stuck branch
+        of `_restart_window` must not complete a bootstrap at all."""
         m = _orchestrator()
-        source_poll = inspect.getsource(m._poll_retell_provider)
-        source_restart = inspect.getsource(m._restart_window)
-        assert "_complete_bootstrap(" in source_poll
-        assert "_complete_bootstrap(" in source_restart
+        assert "_complete_bootstrap(" in inspect.getsource(m._poll_retell_provider)
+        assert "_complete_bootstrap(" not in inspect.getsource(m._restart_window)
 
     def test_run_budget_loop_exists_and_is_gated_on_the_budget_constant(self):
         """v1.14 review fix F2: `_poll_retell_provider` loops on stored pages
@@ -340,12 +419,21 @@ class TestOrchestratorSurface:
         assert "while True" in source
         assert "RETELL_RUN_BUDGET" in source
 
-    def test_page_digest_is_a_hash_not_ids(self):
+    def test_v1_15_events_are_logged_and_the_capped_event_lost_total_pages(self):
+        """v1.15 B8: the three new events exist on the paths that own them,
+        and `retell_bootstrap_capped` is back to provider_id + pages_stored."""
         m = _orchestrator()
-        digest = m._page_digest([{"call_id": "call_b"}, {"call_id": "call_a"}])
-        assert len(digest) == 64 and "call_a" not in digest
-        assert digest == m._page_digest([{"call_id": "call_a"}, {"call_id": "call_b"}])
-        assert m._page_digest([]) is None
+        poll = inspect.getsource(m._poll_retell_provider)
+        restart = inspect.getsource(m._restart_window)
+        assert "retell_page_checkpointed" in poll
+        assert "retell_page_changed" in poll
+        # v1.15.2 F9: the escalation a run of `retell_page_changed` warnings
+        # ends in, so an unstable page is an alertable state and not a silence.
+        assert "retell_page_unstable" in poll
+        assert "retell_bootstrap_stuck" in restart
+        assert "retell_window_stuck" in restart
+        assert "total_pages" not in poll  # the capped event's field is gone with it
+        assert "total_pages" not in restart
 
     def test_constants(self):
         m = _orchestrator()
@@ -372,25 +460,21 @@ class TestOrchestratorSurface:
         assert m.RETELL_LIST_PAGE_LIMIT == 100  # amendment v1.14 A1: was 1000
 
     def test_classify_boundaries(self):
-        from tracer.services.observability_providers import RetellPage
-
+        """v1.15.1 F1: the verdict is a function of the window's accumulated
+        `page_counts` alone — no page argument, so a resumed page cannot be
+        judged on the last response's slice."""
         m = _orchestrator()
+        assert list(inspect.signature(m._classify).parameters) == ["counts"]
 
-        def page(failed):
-            return RetellPage(
-                calls=[],
-                has_more=False,
-                next_key=None,
-                dropped_no_end=0,
-                dropped_missing=0,
-                dropped_failed=failed,
-            )
+        def counts(stored, malformed, export_failed, failed):
+            return [stored, malformed, export_failed, 0, 0, failed]
 
-        assert m._classify(page(0), m.StoreOutcome(0, 0, 0)) == "ok"
-        assert m._classify(page(0), m.StoreOutcome(0, 1000, 0)) == "ok"
-        assert m._classify(page(0), m.StoreOutcome(0, 1, 999)) == "total"
-        assert m._classify(page(0), m.StoreOutcome(0, 999, 1)) == "partial"
-        assert m._classify(page(1), m.StoreOutcome(999, 0, 0)) == "partial"
+        assert m._classify(counts(0, 0, 0, 0)) == "ok"
+        assert m._classify(counts(0, 1000, 0, 0)) == "ok"
+        assert m._classify(counts(0, 1, 999, 0)) == "total"
+        assert m._classify(counts(0, 999, 1, 0)) == "partial"
+        assert m._classify(counts(999, 0, 0, 1)) == "partial"
+        assert m._classify(counts(0, 1, 0, 999)) == "total"  # drops alone decide too
 
     def test_backoff_never_overflows(self):
         m = _orchestrator()
