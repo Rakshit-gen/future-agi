@@ -1281,7 +1281,7 @@ class LLM:
         base_messages = payload.get("messages", messages)
 
         try:
-            logger.info("Final fallback: attempting Vertex Gemini 2.5 Pro")
+            logger.info(f"Final fallback: attempting {vertex_cfg.model_name}")
             vertex_payload = dict(payload)
             vertex_payload["model"] = vertex_cfg.model_name
             vertex_payload["temperature"] = vertex_cfg.temperature
@@ -1292,6 +1292,8 @@ class LLM:
             vertex_payload["messages"] = preprocess_messages_for_provider(
                 base_messages, vertex_cfg.provider
             )
+            if vertex_cfg.vertex_location:
+                vertex_payload["vertex_location"] = vertex_cfg.vertex_location
             response = await litellm.acompletion(
                 **vertex_payload,
                 num_retries=LITELLM_NUM_RETRIES,
@@ -1729,7 +1731,7 @@ class LLM:
         base_messages = payload.get("messages", messages)
 
         try:
-            logger.info("Final fallback: attempting Vertex Gemini 2.5 Pro")
+            logger.info(f"Final fallback: attempting {vertex_cfg.model_name}")
             vertex_payload = dict(payload)
             vertex_payload["model"] = vertex_cfg.model_name
             vertex_payload["temperature"] = vertex_cfg.temperature
@@ -1740,6 +1742,8 @@ class LLM:
             vertex_payload["messages"] = preprocess_messages_for_provider(
                 base_messages, vertex_cfg.provider
             )
+            if vertex_cfg.vertex_location:
+                vertex_payload["vertex_location"] = vertex_cfg.vertex_location
             response = litellm.completion(
                 **vertex_payload,
                 num_retries=LITELLM_NUM_RETRIES,
