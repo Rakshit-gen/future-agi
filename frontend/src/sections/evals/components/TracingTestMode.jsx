@@ -1638,21 +1638,19 @@ const TracingTestMode = React.forwardRef(
                     : "spans"}{" "}
               to preview
             </Typography>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
-              <Typography variant="caption" color="text.secondary">
-                Preview date range
-              </Typography>
-              <DateRangePill
-                dateFilter={previewDateFilter}
-                setDateFilter={setPreviewDateFilter}
-              />
-            </Box>
             <TaskFilterBar
               control={internalFilterForm.control}
               setValue={internalFilterForm.setValue}
               projectId={selectedProjectId}
               isSimulator={isVoiceProject}
               rowType={rowType}
+              toolbarStart={
+                <DateRangePill
+                  dateFilter={previewDateFilter}
+                  setDateFilter={setPreviewDateFilter}
+                  sx={{ height: 30, fontSize: 12 }}
+                />
+              }
             />
           </Box>
         )}

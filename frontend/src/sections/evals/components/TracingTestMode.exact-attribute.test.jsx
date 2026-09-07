@@ -68,7 +68,7 @@ vi.mock(
   }),
 );
 vi.mock("src/sections/tasks/components/TaskFilterBar", () => ({
-  default: () => null,
+  default: ({ toolbarStart }) => toolbarStart || null,
 }));
 vi.mock("./DatasetTestMode", () => ({ JsonValueTree: () => null }));
 vi.mock("./SpanRowList", () => ({ default: () => null }));

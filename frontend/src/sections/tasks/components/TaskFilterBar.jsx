@@ -451,6 +451,7 @@ const TaskFilterBar = ({
   projectId,
   isSimulator = false,
   rowType,
+  toolbarStart,
 }) => {
   // Read the form filters (old format) and mirror them in local state (new format).
   const formFilters = useWatch({ control, name: "filters" });
@@ -592,7 +593,35 @@ const TaskFilterBar = ({
 
   return (
     <Box ref={barRef} sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-      {hasFilters ? (
+      {(toolbarStart || !hasFilters) && (
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          {toolbarStart}
+          <Button
+            onClick={openPanel}
+            variant="outlined"
+            size="small"
+            startIcon={<Iconify icon="mdi:filter-variant" width={14} />}
+            sx={{
+              textTransform: "none",
+              fontWeight: 500,
+              fontSize: "12px",
+              height: 30,
+              width: "fit-content",
+              flexShrink: 0,
+              borderColor: "divider",
+              color: "text.secondary",
+              "&:hover": {
+                borderColor: "text.disabled",
+                bgcolor: "action.hover",
+                color: "text.primary",
+              },
+            }}
+          >
+            Add filter
+          </Button>
+        </Box>
+      )}
+      {hasFilters && (
         <Box
           sx={{
             display: "flex",
@@ -609,38 +638,40 @@ const TaskFilterBar = ({
             />
           ))}
 
-          <Box
-            component="button"
-            type="button"
-            onClick={openPanel}
-            sx={(theme) => ({
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: 26,
-              height: 26,
-              p: 0,
-              border: "1px solid",
-              borderColor: "divider",
-              borderRadius: "6px",
-              bgcolor:
-                theme.palette.mode === "dark"
-                  ? "rgba(255,255,255,0.04)"
-                  : "background.paper",
-              color: "text.secondary",
-              cursor: "pointer",
-              "&:hover": {
-                color: "text.primary",
+          {!toolbarStart && (
+            <Box
+              component="button"
+              type="button"
+              onClick={openPanel}
+              sx={(theme) => ({
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 26,
+                height: 26,
+                p: 0,
+                border: "1px solid",
+                borderColor: "divider",
+                borderRadius: "6px",
                 bgcolor:
                   theme.palette.mode === "dark"
-                    ? "rgba(255,255,255,0.08)"
-                    : "action.hover",
-                borderColor: "text.disabled",
-              },
-            })}
-          >
-            <Iconify icon="mdi:plus" width={14} />
-          </Box>
+                    ? "rgba(255,255,255,0.04)"
+                    : "background.paper",
+                color: "text.secondary",
+                cursor: "pointer",
+                "&:hover": {
+                  color: "text.primary",
+                  bgcolor:
+                    theme.palette.mode === "dark"
+                      ? "rgba(255,255,255,0.08)"
+                      : "action.hover",
+                  borderColor: "text.disabled",
+                },
+              })}
+            >
+              <Iconify icon="mdi:plus" width={14} />
+            </Box>
+          )}
 
           <Box sx={{ flex: 1 }} />
           <Button
@@ -658,29 +689,6 @@ const TaskFilterBar = ({
             Clear
           </Button>
         </Box>
-      ) : (
-        <Button
-          onClick={openPanel}
-          variant="outlined"
-          size="small"
-          startIcon={<Iconify icon="mdi:filter-variant" width={14} />}
-          sx={{
-            textTransform: "none",
-            fontWeight: 500,
-            fontSize: "12px",
-            height: 30,
-            width: "fit-content",
-            borderColor: "divider",
-            color: "text.secondary",
-            "&:hover": {
-              borderColor: "text.disabled",
-              bgcolor: "action.hover",
-              color: "text.primary",
-            },
-          }}
-        >
-          Add filter
-        </Button>
       )}
 
       <TraceFilterPanel
@@ -713,6 +721,7 @@ TaskFilterBar.propTypes = {
   projectId: PropTypes.string,
   isSimulator: PropTypes.bool,
   rowType: PropTypes.string,
+  toolbarStart: PropTypes.node,
 };
 
 export default TaskFilterBar;
