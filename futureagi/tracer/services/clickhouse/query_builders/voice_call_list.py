@@ -151,6 +151,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
         *,
         candidate_full_state: bool = False,
         public_candidate_witness: bool = False,
+        trace_builder_cls: type[TraceListQueryBuilder] = TraceListQueryBuilder,
     ) -> TraceListQueryBuilder:
         """Build the trace selector used by every voice-list page.
 
@@ -186,7 +187,7 @@ class VoiceCallListQueryBuilder(BaseQueryBuilder):
                     },
                 }
             )
-        delegate = TraceListQueryBuilder(
+        delegate = trace_builder_cls(
             project_id=self.project_id,
             project_ids=self.project_ids,
             page_number=self.page_number,

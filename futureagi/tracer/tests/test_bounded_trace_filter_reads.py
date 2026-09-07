@@ -2906,7 +2906,7 @@ def test_long_window_trace_exact_text_prefers_indexed_candidate_to_child_anchor(
     assert params["filter_anchor_limit"] == 64
 
 
-def test_long_window_voice_exact_text_forwards_complete_indexed_anchor() -> None:
+def test_long_window_voice_exact_text_prefers_required_indexed_candidate() -> None:
     recording_url = (
         "https://recordings.example.test/synthetic-recording-0000000000000000000000"
     )
@@ -2924,7 +2924,15 @@ def test_long_window_voice_exact_text_forwards_complete_indexed_anchor() -> None
     )
 
     assert builder.allow_filter_anchor_probe_for_initial_continuation() is True
-    assert builder.supports_filter_anchor_probe() is True
+    assert builder.supports_filter_anchor_probe() is False
+    assert builder.supports_filter_candidate_seed_page() is True
+    candidate_sql, candidate_params = builder.build_filter_candidate_seed_page(
+        slice_start=START, slice_end=END, limit=50
+    )
+    assert "matching_scalar_trace_identities" in candidate_sql
+    assert "indexHint(arrayStringConcat" in candidate_sql
+    assert candidate_params["latest_filter_param_0"] == (recording_url,)
+    # Explicit legacy probes remain valid, but do not replace required seeds.
     assert builder.filter_anchor_probe_proves_complete_population() is True
     assert builder.recommended_filter_anchor_probe_limit() == 64
     assert builder.recommended_filter_anchor_probe_timeout_ms() is None

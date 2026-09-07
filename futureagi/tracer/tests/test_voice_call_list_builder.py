@@ -504,15 +504,16 @@ def test_voice_long_exact_text_filter_prefilters_one_finite_seed_then_hydrates()
         row["trace_id"] for row in exact_matches[:25]
     ]
     assert [attempt.kind for attempt in page.attempts] == [
-        "anchor",
+        "seed",
         "prefilter",
         "classify",
         "classify",
         "classify",
         "hydrate",
     ]
-    assert executor.calls[0][1]["filter_anchor_limit"] == 64
-    assert "filter_seed_limit" not in executor.calls[0][1]
+    assert "matching_scalar_trace_identities" in executor.calls[0][0]
+    assert executor.calls[0][1]["filter_seed_limit"] == 512
+    assert "filter_anchor_limit" not in executor.calls[0][1]
     assert executor.results == []
 
 
