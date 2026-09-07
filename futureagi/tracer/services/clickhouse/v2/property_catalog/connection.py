@@ -224,11 +224,10 @@ class PropertyCatalogReadExecutor:
         )
         if self._application_read:
             # Validate caller settings above before adding the code-owned policy.
-            # Public reads inherit the configured application memory ceiling,
-            # not the historical catalog maintenance budget. SQL LIMIT, catalog
-            # identity/allowlist and spilling remain unchanged.
+            # Preserve the catalog memory budget: its read-only identity may
+            # enforce a smaller limit than the general application ceiling.
+            # Statement caps are removed; SQL LIMIT and spilling are unchanged.
             bounded_timeout_ms = None
-            query_settings.pop("max_memory_usage", None)
             query_settings = application_read_settings(query_settings)
         if self._client is None:
             self._client = self._client_factory(self._config)

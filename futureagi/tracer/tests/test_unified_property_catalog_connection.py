@@ -552,7 +552,7 @@ def test_public_catalog_read_has_no_statement_caps_and_restores_context(progress
     assert client.calls[0][2] is None
     applied = client.calls[0][3]
     assert all(applied[name] == 0 for name in UNLIMITED_STATEMENT_SETTINGS)
-    assert applied["max_memory_usage"] == 36 * 1024**3
+    assert applied["max_memory_usage"] == 512 * 1024**2
     assert applied["max_bytes_before_external_sort"] == 32 * 1024**2
     assert result.data == [{"status": "ok"}]
     assert result.read_rows == (25 if progress else None)

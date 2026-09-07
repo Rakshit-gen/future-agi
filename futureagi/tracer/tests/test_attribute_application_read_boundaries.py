@@ -116,7 +116,7 @@ def _request_settings():
 
 
 @pytest.mark.parametrize("lane", ["raw", "catalog"])
-@pytest.mark.parametrize("ceiling", [8 * GiB, 36 * GiB, 48 * GiB])
+@pytest.mark.parametrize("ceiling", [256 * 1024**2, 8 * GiB, 36 * GiB, 48 * GiB])
 @pytest.mark.parametrize("original_timeout", [10, None])
 def test_public_dispatch_then_bounded_maintenance_restores_same_pool(
     monkeypatch, lane, ceiling, original_timeout
@@ -145,7 +145,8 @@ def test_public_dispatch_then_bounded_maintenance_restores_same_pool(
         assert connection.sync_request_timeout == 1
         applied = kwargs["settings"]
         assert all(applied[key] == 0 for key in UNLIMITED_STATEMENT_SETTINGS)
-        assert applied["max_memory_usage"] == ceiling > 0
+        expected_memory = ceiling if lane == "raw" else min(MAINTENANCE_MEMORY, ceiling)
+        assert applied["max_memory_usage"] == expected_memory > 0
         for key in (
             "max_threads",
             "max_concurrent_queries_for_user",
