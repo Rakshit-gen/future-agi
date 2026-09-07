@@ -38,15 +38,19 @@ vi.mock("src/utils/axios", () => ({
   },
 }));
 vi.mock("src/sections/tasks/components/TaskFilterBar", () => ({
-  default: ({ setValue }) =>
-    mocks.hostedRows ? (
-      <button
-        type="button"
-        onClick={() => setValue("filters", mocks.hostedRows)}
-      >
-        Apply hosted filters
-      </button>
-    ) : null,
+  default: ({ setValue, toolbarStart }) => (
+    <>
+      {toolbarStart}
+      {mocks.hostedRows && (
+        <button
+          type="button"
+          onClick={() => setValue("filters", mocks.hostedRows)}
+        >
+          Apply hosted filters
+        </button>
+      )}
+    </>
+  ),
 }));
 vi.mock("src/sections/evals/components/DatasetTestMode", () => ({
   JsonValueTree: () => null,
