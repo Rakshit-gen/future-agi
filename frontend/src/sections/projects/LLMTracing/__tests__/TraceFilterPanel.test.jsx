@@ -3937,6 +3937,41 @@ describe("exact manual attribute fallback", () => {
 
 describe("filter-value picker bounded-read UX", () => {
   it.each([
+    ["system", "SYSTEM_METRIC", "system_attribute:traces:trace_name", "trace_name"],
+    ["attribute", "SPAN_ATTRIBUTE", "custom_attribute:name", "name"],
+  ])("keeps %s Trace Name suggestions separate from raw name attributes", async (
+    category, apiColType, propertyId, metricName,
+  ) => {
+    const onApply = vi.fn();
+    dashboardFilterValuesMock.mockImplementation((request) => ({
+      ...defaultDashboardFilterValues(),
+      data: request.propertyId === propertyId && request.metricName === metricName
+        ? [{ value: "example-trace", label: "example-trace" }]
+        : [],
+    }));
+    const { anchorEl } = renderPanel({
+      source: "traces",
+      propertyNamespace: "traces",
+      projectId: "project-trace-values",
+      properties: [{ id: "name", name: "Trace Name", category, type: "string", apiColType }],
+      currentFilters: [{
+        field: "name", fieldName: "Trace Name", fieldCategory: category,
+        fieldType: "string", apiColType, operator: "in", value: [],
+      }],
+      onApply,
+    });
+    fireEvent.click(document.querySelector('[data-filter-value-trigger="name"]'));
+    fireEvent.click(await screen.findByRole("checkbox", { name: "example-trace" }));
+    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(expect.objectContaining({
+      propertyId, metricName, source: "traces", enabled: true,
+    }));
+    await waitFor(() => expect(onApply).toHaveBeenCalledWith(expect.arrayContaining([
+      expect.objectContaining({ field: "name", apiColType, value: ["example-trace"] }),
+    ])));
+    document.body.removeChild(anchorEl);
+  });
+
+  it.each([
     ["users", "system", "SYSTEM_METRIC", "system_attribute:users:user", "user", "sessions"],
     ["sessions", "system", "SYSTEM_METRIC", "system_attribute:sessions:user", "user", "sessions"],
     ["users", "attribute", "SPAN_ATTRIBUTE", "custom_attribute:user_id", "user_id", "traces"],
@@ -5599,6 +5634,28 @@ describe("filter-value picker bounded-read UX", () => {
         ),
       { timeout: 1_500 },
     );
+    document.body.removeChild(anchorEl);
+  });
+
+  it("uses the Trace Name registry identity for Query-tab suggestions", async () => {
+    const { anchorEl } = renderPanel({
+      properties: [{ id: "name", name: "Trace Name", category: "system", type: "string", apiColType: "SYSTEM_METRIC" }],
+      projectId: "project-trace-query",
+      source: "traces",
+      propertyNamespace: "traces",
+      showQueryTab: true,
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+    await selectQueryPhaseOption("Trace Name", "pick operator...");
+    await waitFor(() => expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        propertyId: "system_attribute:traces:trace_name",
+        metricName: "trace_name",
+        metricType: "system_metric",
+        source: "traces",
+        enabled: true,
+      }),
+    ));
     document.body.removeChild(anchorEl);
   });
 

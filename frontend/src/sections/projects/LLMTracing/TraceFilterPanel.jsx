@@ -127,6 +127,7 @@ const filterValueAdapterMetricName = (source, propertyId, metricType) => {
   }
   // Registry identities use these canonical dimension names. Keep the native
   // filter column spelling in the row, and never rename same-name attributes.
+  if (source === "traces" && propertyId === "name") return "trace_name";
   return (
     { project_id: "project", session_id: "session", user_id: "user" }[
       propertyId
