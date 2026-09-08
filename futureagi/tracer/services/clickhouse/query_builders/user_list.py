@@ -373,6 +373,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
             ],
         )
         witness, witness_params = self._positive_scalar_user_witness()
+        label_witness, label_params = self._positive_user_id_witness()
         return builder.build_candidate_page_query(
             cursor_mode=True,
             cursor_before=(before_first_seen, str(before_end_user_id))
@@ -380,7 +381,49 @@ class UserListQueryBuilder(BaseQueryBuilder):
             else None,
             scalar_witness=witness,
             scalar_witness_params=witness_params,
+            label_witness=label_witness,
+            label_witness_params=label_params,
         )
+
+    def _positive_user_id_witness(self) -> tuple[str, dict[str, Any]]:
+        """Narrow canonical labels without changing the manager's final match."""
+        clauses: list[str] = []
+        params: dict[str, Any] = {}
+        for index, item in enumerate(self.filters):
+            if (
+                item.get("column_id") != "user_id"
+                or not self._is_output_filter(item)
+                or self._is_relation_filter(item)
+            ):
+                continue
+            config = item.get("filter_config") or {}
+            op = config.get("filter_op")
+            if op not in {"equals", "in"}:
+                continue
+            value = config.get("filter_value")
+            values = value if op == "in" and isinstance(value, list) else [value]
+            # The manager canonicalizes JSON and boolean-looking strings. Keep
+            # those shapes on its full path instead of approximating that rule.
+            if not values or any(
+                not isinstance(v, str)
+                or not v.isascii()
+                or v.strip().startswith(("{", "["))
+                or v.strip().lower() in {"true", "false"}
+                for v in values
+            ):
+                continue
+            key = f"candidate_user_label_{index}"
+            if config.get("filter_type") in {"text", "string"}:
+                params[key] = tuple(v.lower() for v in values)
+                # Python and ClickHouse Unicode lowercasing need not agree.
+                # Preserve every non-ASCII label for exact manager evaluation.
+                clauses.append(
+                    f"(NOT match(user_id, '^[[:ascii:]]*$') OR lower(user_id) IN %({key})s)"
+                )
+            else:
+                params[key] = tuple(values)
+                clauses.append(f"user_id IN %({key})s")
+        return " AND ".join(clauses), params
 
     def _positive_scalar_user_witness(self) -> tuple[str, dict[str, Any]]:
         """Reuse the compiler's complete numeric witness; decline all other shapes."""
@@ -511,6 +554,8 @@ class UserListQueryBuilder(BaseQueryBuilder):
         cursor_before: tuple[Any, str] | None = None,
         scalar_witness: str = "",
         scalar_witness_params: dict[str, Any] | None = None,
+        label_witness: str = "",
+        label_witness_params: dict[str, Any] | None = None,
     ) -> tuple[str, str, dict[str, Any]]:
         """One six-key latest replay for finite, numbered and cursor user reads.
 
@@ -566,6 +611,13 @@ class UserListQueryBuilder(BaseQueryBuilder):
             else ""
         )
         final_filter = f"WHERE {output_where}" if output_where else ""
+        if label_witness:
+            self.params.update(label_witness_params or {})
+            final_filter = (
+                f"{final_filter} AND ({label_witness})"
+                if final_filter
+                else f"WHERE {label_witness}"
+            )
         order_by = self._order_by()
         if cursor_mode:
             order_by = "ORDER BY last_active DESC NULLS LAST, end_user_id DESC"
@@ -840,6 +892,8 @@ class UserListQueryBuilder(BaseQueryBuilder):
         cursor_before: tuple[Any, str] | None = None,
         scalar_witness: str = "",
         scalar_witness_params: dict[str, Any] | None = None,
+        label_witness: str = "",
+        label_witness_params: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Return only the finite user page selected from compact dimensions."""
 
@@ -852,6 +906,8 @@ class UserListQueryBuilder(BaseQueryBuilder):
             cursor_before=cursor_before,
             scalar_witness=scalar_witness,
             scalar_witness_params=scalar_witness_params,
+            label_witness=label_witness,
+            label_witness_params=label_witness_params,
         )
         query = f"""
         WITH

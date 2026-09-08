@@ -92,6 +92,92 @@ def users_engine(engine):  # noqa: F811 -- fixture injection
 
 
 @pytest.mark.parametrize("workspace", [False, True])
+def test_native_user_id_candidate_filter_preserves_latest_labels_aliases_and_deletions(
+    users_engine, workspace
+):
+    execute, insert = users_engine
+    for number, minute in ((10, 30), (50, 35), (20, 45), (70, 55), (120, 50)):
+        insert(
+            id=f"label-test-{number}",
+            end_user_id=uid(number),
+            cost=1,
+            project_id=OTHER_PROJECT if number == 120 else PROJECT,
+            end_time=(START + timedelta(minutes=minute)).isoformat(" "),
+        )
+    insert(id="label-test-70", end_user_id=uid(70), is_deleted=1, _version=2)
+    execute(
+        "INSERT INTO end_users (project_id, organization_id, end_user_id, user_id, first_seen, version) "
+        "VALUES (%(project)s, %(project)s, %(user)s, 'target-user', %(start)s, %(version)s)",
+        {
+            "project": PROJECT,
+            "user": uid(10),
+            "start": START,
+            "version": START + timedelta(seconds=1),
+        },
+    )
+    target = users_builder(workspace=workspace)
+    target.filters.append(
+        leaf("text", "in", ["TARGET-USER"], column="user_id", source="SYSTEM_METRIC")
+    )
+    # The matching canonical user is older than unrelated candidates. A page
+    # limit must not force the manager to replay every rejected user first.
+    rows = execute(
+        *target.build_dimension_candidate_query(
+            limit=1, window_start=WINDOW, window_end=END
+        )
+    )
+    assert len(rows) == 1
+    assert rows[0]["end_user_id"] == uid(10)
+    assert rows[0]["user_id"] == "target-user"
+    assert rows[0]["total_cost"] == 2
+    assert datetime.fromisoformat(rows[0]["last_active"]) == START + timedelta(
+        minutes=35
+    )
+    # The old label and a folded alias label must not become native matches.
+    for old_label in ("user-10", "user-50", "user-70"):
+        target.filters[-1] = leaf(
+            "text", "in", [old_label], column="user_id", source="SYSTEM_METRIC"
+        )
+        assert (
+            execute(
+                *target.build_dimension_candidate_query(
+                    limit=1, window_start=WINDOW, window_end=END
+                )
+            )
+            == []
+        )
+
+
+def test_native_user_id_candidate_filter_keeps_unicode_case_matches(users_engine):
+    execute, insert = users_engine
+    execute(
+        "INSERT INTO end_users (project_id, organization_id, end_user_id, user_id, first_seen, version) "
+        "VALUES (%(project)s, %(project)s, %(user)s, %(label)s, %(start)s, %(version)s)",
+        {
+            "project": PROJECT,
+            "user": uid(20),
+            "label": "K",
+            "start": START,
+            "version": START + timedelta(seconds=1),
+        },
+    )
+    insert(id="unicode-label", end_user_id=uid(20))
+    target = users_builder()
+    target.filters.append(
+        leaf("text", "in", ["k"], column="user_id", source="SYSTEM_METRIC")
+    )
+    rows = execute(
+        *target.build_dimension_candidate_query(
+            limit=1, window_start=WINDOW, window_end=END
+        )
+    )
+    assert [row["end_user_id"] for row in rows] == [uid(20)]
+    assert UsersListManager._candidate_value_matches(
+        rows[0]["user_id"], "in", ["k"], case_insensitive=True
+    )
+
+
+@pytest.mark.parametrize("workspace", [False, True])
 def test_native_users_population_activity_order_aliases_and_null_pages(
     users_engine, workspace
 ):

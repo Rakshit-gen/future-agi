@@ -87,6 +87,67 @@ def test_null_activity_boundary_stays_in_null_suffix():
 
 
 @pytest.mark.parametrize("workspace", [False, True])
+@pytest.mark.parametrize(
+    "op,value", [("equals", "Guest-A"), ("in", ["Guest-A", "Guest-B"])]
+)
+def test_native_user_id_witness_is_after_latest_replay_before_candidate_limit(
+    workspace, op, value
+):
+    item = {
+        "column_id": "user_id",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "text",
+            "filter_op": op,
+            "filter_value": value,
+        },
+    }
+    sql, params = builder(workspace, [item]).build_dimension_candidate_query(
+        limit=2,
+        window_start=START,
+        window_end=END,
+    )
+    candidate = cte(sql, "candidate_users")
+    assert (
+        "NOT match(user_id, '^[[:ascii:]]*$') OR lower(user_id) IN %(candidate_user_label_0)s"
+        in candidate
+    )
+    assert candidate.index("candidate_user_label_0") < candidate.index("LIMIT")
+    assert "candidate_user_label_0" not in cte(sql, "filtered_end_users_raw")
+    assert "candidate_user_label_0" not in cte(sql, "latest_candidate_spans")
+    assert params["candidate_user_label_0"] == (
+        ("guest-a",) if op == "equals" else ("guest-a", "guest-b")
+    )
+    assert_window_replay(sql, params)
+
+
+@pytest.mark.parametrize(
+    "source,op,value",
+    [
+        ("SPAN_ATTRIBUTE", "in", ["guest-a"]),
+        ("EVAL_METRIC", "in", ["guest-a"]),
+        ("SYSTEM_METRIC", "not_in", ["guest-a"]),
+        ("SYSTEM_METRIC", "in", ["équipe"]),
+        ("SYSTEM_METRIC", "in", ["true"]),
+        ("SYSTEM_METRIC", "in", ['{"a":1}']),
+        ("SYSTEM_METRIC", "in", [None]),
+        ("SYSTEM_METRIC", "in", []),
+    ],
+)
+def test_user_id_witness_declines_non_native_or_non_literal_shapes(source, op, value):
+    item = {
+        "column_id": "user_id",
+        "filter_config": {
+            "col_type": source,
+            "filter_type": "text",
+            "filter_op": op,
+            "filter_value": value,
+        },
+    }
+    assert builder(filters=[item])._positive_user_id_witness() == ("", {})
+
+
+@pytest.mark.parametrize("workspace", [False, True])
 def test_scalar_witness_narrows_groups_not_activity_or_replacement(workspace):
     sql, params = builder(workspace, [raw_filter()]).build_dimension_candidate_query(
         limit=26,
